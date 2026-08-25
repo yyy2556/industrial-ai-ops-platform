@@ -1,0 +1,33 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local data and generated outputs
+data/*.csv
+data/*.parquet
+data/*.xlsx
+!data/unified_data.csv
+docs/*.png
+docs/*.jpg
+docs/*.jpeg
+
+# Local project archive and unrelated legacy projects
+old project/
+
+# Jupyter and Streamlit local files
+.ipynb_checkpoints/
+.streamlit/secrets.toml
+
+# IDE and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
