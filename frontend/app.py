@@ -1,3 +1,4 @@
+
 """Streamlit page for heat-load backtesting and model interpretation."""
 
 from pathlib import Path
@@ -956,6 +957,303 @@ def render_report_page() -> None:
 st.set_page_config(page_title="工业 AI 运维平台", layout="wide")
 
 
+def inject_app_styles() -> None:
+    """Apply the shared industrial operations console visual system."""
+    st.markdown(
+        '''
+        <style>
+        :root {
+            --ops-ink: #0f172a;
+            --ops-muted: #64748b;
+            --ops-border: #dbe3ed;
+            --ops-surface: #ffffff;
+            --ops-canvas: #f4f7fb;
+            --ops-blue: #1d4ed8;
+            --ops-blue-dark: #163b7a;
+            --ops-amber: #b45309;
+            --ops-red: #b91c1c;
+            --ops-green: #047857;
+        }
+
+        html, body, [class*="css"] {
+            font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+            color: var(--ops-ink);
+        }
+
+        .stApp {
+            background: var(--ops-canvas);
+        }
+
+        [data-testid="stAppViewContainer"] {
+            background: var(--ops-canvas);
+        }
+
+        [data-testid="stHeader"] {
+            background: transparent;
+        }
+
+        [data-testid="stSidebar"] {
+            background: var(--ops-ink);
+            border-right: 1px solid #1e293b;
+        }
+
+        [data-testid="stSidebar"] > div:first-child {
+            padding: 1.5rem 1rem;
+        }
+
+        [data-testid="stSidebar"] * {
+            color: #e2e8f0;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stRadio"] label {
+            border-radius: 6px;
+            padding: 0.58rem 0.7rem;
+            margin: 0.18rem 0;
+            transition: background 180ms ease, color 180ms ease;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+            background: #1e293b;
+            color: #ffffff;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+            background: #1e40af;
+            color: #ffffff;
+            box-shadow: inset 3px 0 0 #60a5fa;
+        }
+
+        [data-testid="stSidebar"] .stButton > button {
+            width: 100%;
+            min-height: 2.6rem;
+            border: 1px solid #475569;
+            background: #1e293b;
+            color: #f8fafc;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:hover {
+            border-color: #93c5fd;
+            background: #263852;
+            color: #ffffff;
+        }
+
+        .ops-brand {
+            padding: 0.2rem 0 1.5rem;
+            border-bottom: 1px solid #334155;
+            margin-bottom: 1.25rem;
+        }
+
+        .ops-brand-mark {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            margin-bottom: 0.7rem;
+            border: 1px solid #60a5fa;
+            border-radius: 5px;
+            color: #bfdbfe;
+            font: 700 0.78rem/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+            letter-spacing: 0;
+        }
+
+        .ops-brand-title {
+            margin: 0;
+            color: #f8fafc;
+            font-size: 1.02rem;
+            font-weight: 700;
+            letter-spacing: 0;
+        }
+
+        .ops-brand-subtitle {
+            margin: 0.35rem 0 0;
+            color: #94a3b8;
+            font-size: 0.78rem;
+        }
+
+        [data-testid="stMainBlockContainer"] {
+            max-width: 1480px;
+            padding-top: 2.2rem;
+            padding-bottom: 3rem;
+        }
+
+        [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {
+            gap: 0.9rem;
+        }
+
+        [data-testid="stMarkdownContainer"] p {
+            line-height: 1.55;
+        }
+
+        [data-testid="stCaptionContainer"] {
+            color: var(--ops-muted);
+        }
+
+        h1 {
+            color: var(--ops-blue-dark);
+            font-size: clamp(1.65rem, 2.3vw, 2.25rem);
+            font-weight: 750;
+            letter-spacing: 0;
+            margin-bottom: 0.35rem;
+        }
+
+        h2, h3 {
+            color: var(--ops-ink);
+            letter-spacing: 0;
+        }
+
+        h3 {
+            margin-top: 1.65rem;
+            font-size: 1.05rem;
+        }
+
+        [data-testid="stMetric"] {
+            min-height: 7rem;
+            padding: 1rem 1.1rem;
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: var(--ops-muted);
+            font-size: 0.82rem;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: var(--ops-blue-dark);
+            font-size: 1.65rem;
+            font-weight: 700;
+        }
+
+        .stButton > button, .stDownloadButton > button,
+        [data-testid="stFormSubmitButton"] > button {
+            min-height: 2.6rem;
+            border-radius: 6px;
+            border: 1px solid #bfdbfe;
+            font-weight: 650;
+            transition: background 180ms ease, border-color 180ms ease, transform 180ms ease;
+        }
+
+        .stButton > button[kind="primary"],
+        [data-testid="stFormSubmitButton"] > button[kind="primary"] {
+            border-color: var(--ops-blue);
+            background: var(--ops-blue);
+            color: #ffffff;
+        }
+
+        .stButton > button[kind="primary"]:hover,
+        [data-testid="stFormSubmitButton"] > button[kind="primary"]:hover {
+            border-color: var(--ops-blue-dark);
+            background: var(--ops-blue-dark);
+        }
+
+        .stButton > button:hover, .stDownloadButton > button:hover,
+        [data-testid="stFormSubmitButton"] > button:hover {
+            border-color: var(--ops-blue);
+            transform: translateY(-1px);
+        }
+
+        [data-testid="stDataFrame"] {
+            overflow: hidden;
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+        }
+
+        [data-testid="stDataFrame"] iframe {
+            border-radius: 7px;
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 7px;
+            border-left-width: 4px;
+        }
+
+        [data-testid="stFileUploader"] {
+            padding: 0.35rem;
+            border: 1px dashed #93c5fd;
+            border-radius: 8px;
+            background: #f8fbff;
+        }
+
+        [data-testid="stPlotlyChart"] {
+            padding: 0.4rem 0.45rem 0.1rem;
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+        }
+
+        input, textarea, [data-baseweb="select"] > div {
+            border-radius: 6px !important;
+        }
+
+        input:focus, textarea:focus,
+        [data-baseweb="select"] > div:focus-within,
+        button:focus-visible {
+            outline: 3px solid rgba(37, 99, 235, 0.28) !important;
+            outline-offset: 2px;
+        }
+
+        [data-testid="stExpander"] {
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+        }
+
+        [data-testid="stFileUploaderDropzone"] {
+            min-height: 8rem;
+            border-color: #93c5fd;
+            background: #ffffff;
+        }
+
+        [data-testid="stStatusWidget"] {
+            border-radius: 6px;
+        }
+
+        @media (max-width: 768px) {
+            [data-testid="stMainBlockContainer"] {
+                padding: 1.25rem 1rem 2rem;
+            }
+
+            h1 {
+                font-size: 1.55rem;
+            }
+
+            [data-testid="stMetric"] {
+                min-height: 6.2rem;
+                padding: 0.8rem;
+            }
+
+            [data-testid="stMetricValue"] {
+                font-size: 1.35rem;
+            }
+
+            [data-testid="stSidebar"] > div:first-child {
+                padding: 1rem 0.8rem;
+            }
+
+            [data-testid="stFileUploaderDropzone"] {
+                min-height: 7rem;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                scroll-behavior: auto !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+        </style>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+
+inject_app_styles()
+
+
 def render_login() -> None:
     """Render the demo login gate."""
     st.title("工业 AI 运维平台")
@@ -986,6 +1284,16 @@ if st.session_state.get("show_login"):
     st.stop()
 
 with st.sidebar:
+    st.markdown(
+        '''
+        <div class="ops-brand">
+            <div class="ops-brand-mark">AI</div>
+            <p class="ops-brand-title">工业 AI 运维平台</p>
+            <p class="ops-brand-subtitle">Heat Exchange Station Console</p>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
     if st.session_state.get("authenticated"):
         st.caption(f"当前用户：{st.session_state.get('display_name', st.session_state['user_id'])}")
         if st.button("退出登录", key="logout_button"):

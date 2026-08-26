@@ -1,11 +1,15 @@
 # 工业 AI 运维平台
 
-[![Version](https://img.shields.io/badge/version-v0.4.1-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 项目简介
 
-面向换热站场景的工业 AI 运维与能效优化平台，包含热负荷预测、无监督异常检测、异常原因分析、异常事件合并、PMV/PPD 热舒适度评估、SHAP 可解释性分析和 DeepSeek 智能报告生成。当前版本仍是历史回测、手动参数演示和辅助分析系统，不是生产系统。
+面向换热站场景的工业 AI 运维与能效分析平台，提供热负荷预测、异常检测、PMV/PPD 热舒适度评估、SHAP 分析和 DeepSeek 智能报告。当前为公开演示版，主要用于历史回测和辅助分析。
+
+在线演示：[industrial-ai-ops-platform.streamlit.app](https://industrial-ai-ops-platform.streamlit.app/)
+
+访问提示：国内用户访问该演示地址可能需要代理。
 
 ## 系统架构
 
@@ -22,7 +26,8 @@
 - **异常检测**：Isolation Forest 标记（34,368 行 / 737 事件）、事件合并、规则根因分析
 - **热舒适**：ISO 7730 PMV/PPD 计算（典型工况 -0.213 / 5.94%）
 - **智能报告**：DeepSeek 三 Agent 编排、八章节报告、Markdown 下载
-- **用户与存储**：演示登录（按用户隔离）、SQLite 历史报告、缓存与上传限制
+- **用户与存储**：访客模式、演示登录、按用户隔离报告、SQLite 历史报告、缓存与上传限制
+- **界面体验**：工业运维控制台风格、统一指标卡与图表、响应式布局和键盘焦点支持
 
 ## 快速开始
 
@@ -141,20 +146,17 @@ DeepSeek API 调用可能产生费用并受账户额度、请求频率和模型�
 | v0.3.0 | DeepSeek 三 Agent 编排（诊断/建议/报告）、八章节智能运维报告页面 |
 | v0.4.0 | CSV 上传校验、业务页面接入、SQLite 历史报告存储与查询 |
 | v0.4.1 | 演示登录系统（按用户隔离报告）、缓存与上传限制（20MB/200k 行）、Markdown 报告下载、访客模式 |
+| v1.0.0 | 工业运维控制台视觉升级、统一页面样式、响应式布局、访客直接使用和按需登录 |
 
 ## 当前限制
 
 - 演示数据中的 flow_rate、power_consumption、indoor_temp、humidity 为空，数字孪生和 PMV 自动联动暂不可用，PMV 使用手动输入。
 - 异常检测结果来自无监督模型，不等于已确认故障；智能报告仅供人工参考，所有建议需人工确认后执行。
 - 智能报告依赖外部 DeepSeek API，不保证持续可用，API 调用可能产生费用。
-- 当前登录系统为演示级（demo/demo123、admin/admin123），不适合公网正式环境；未登录可正常使用分析和 API，但报告不会保存到历史记录。
+- 当前登录系统为演示级（demo/demo123、admin/admin123），不适合正式公网环境；未登录可正常使用分析和 API，但报告不会保存到历史记录。
 - SQLite 历史报告存储在本地，公网平台（如 Streamlit Community Cloud）不保证长期保留；CSV 上传限制为 20MB、200,000 行，缓存最多保留 3 天和最近 5 个数据集。
 
 由于数据中包含较多零负荷和低负荷样本，百分比误差指标对接近零的真实值非常敏感。因此，当前版本的主要模型指标使用 MAE、RMSE 和 R²，并结合不同热负荷区间的分层结果进行解读，不使用单一百分比误差指标判断模型效果。
-
-## 版本路线
-
-- v1.0.0：公网可用版本，包括稳定部署、用户数据隔离、API 调用限制和持久化存储。
 
 ## 免责声明
 
