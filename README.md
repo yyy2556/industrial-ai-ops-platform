@@ -1,17 +1,19 @@
 # 工业 AI 运维平台
 
-[![Version](https://img.shields.io/badge/version-v0.2.0-blue)](https://github.com/yyy2556/industrial-ai-ops-platform/releases/tag/v0.2.0)
+[![Version](https://img.shields.io/badge/version-v0.3.0--dev-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 项目简介
 
-面向换热站场景的工业 AI 运维与能效优化平台，包含热负荷预测、无监督异常检测、异常原因分析、异常事件合并、PMV/PPD 热舒适度评估和 SHAP 可解释性分析。当前版本仍以历史数据回测和手动参数演示为主，用于验证模型与运维分析流程。
+面向换热站场景的工业 AI 运维与能效优化平台，包含热负荷预测、无监督异常检测、异常原因分析、异常事件合并、PMV/PPD 热舒适度评估、SHAP 可解释性分析和 DeepSeek 智能报告生成。当前版本仍是历史回测、手动参数演示和辅助分析系统，不是生产系统。
 
 ## 系统架构
 
 数据按照以下流程处理：
 
 数据文件 unified_data.csv -> 数据加载与清洗 -> 特征工程 -> XGBoost 热负荷预测 / Isolation Forest 异常检测 -> 原因分析、事件合并、评估与可解释性分析 -> Streamlit 多页面应用
+
+异常事件 + 手动舒适度参数 -> 诊断 Agent -> 建议 Agent -> 报告 Agent -> 智能运维报告
 
 ## 已完成功能
 
@@ -29,6 +31,13 @@
 - Streamlit 多页面应用：包含负荷预测、异常检测和热舒适度页面。
 - YAML 配置化：设备类型、预测特征、异常检测特征、模型参数和部分异常规则集中维护在 config/device_profiles.yaml。
 - 预测与异常模块从 YAML 读取配置，减少算法参数和业务配置的重复维护。
+- DeepSeek API 底层调用：通过 HTTPS Chat Completions 接口调用指定模型。
+- API Key 密码输入和安全处理：页面使用密码框，Key 仅在用户点击生成报告时临时使用。
+- 诊断 Agent：基于结构化异常事件摘要生成有限长度的诊断摘要。
+- 建议 Agent：根据诊断结果和可选舒适度数据生成需要人工确认的运维建议。
+- 完整报告 Agent：整合诊断和建议，生成八章节智能运维报告。
+- 八章节智能运维报告：覆盖异常概况、判断、优先级、检查对象、观察时间、人工确认、禁止自动执行操作和限制说明。
+- Streamlit 智能报告页面：选择异常事件、填写手动舒适度参数并按需生成报告。
 - 当前页面明确标注为历史回测或手动演示，不将分析结果表述为真实未来预测或已确认故障。
 
 ## 快速开始
@@ -65,14 +74,14 @@
     │   ├── digital_twin.py        # 理论热负荷和残差计算接口
     │   ├── anomaly.py             # Isolation Forest、原因分析和事件合并
     │   ├── comfort.py             # PMV/PPD 热舒适度计算
-    │   ├── agents.py              # 大模型 Agent 模块预留
+    │   ├── agents.py              # DeepSeek API 和 Agent
     │   └── config.py              # YAML 设备配置加载
     ├── config/
     │   └── device_profiles.yaml   # 换热站预测与异常检测配置
     ├── data/
     │   └── unified_data.csv       # 统一换热站演示数据
     ├── frontend/
-    │   └── app.py                 # Streamlit 回测页面
+    │   └── app.py                 # 四页 Streamlit 应用
     ├── notebooks/                 # 探索性分析目录
     ├── requirements.txt           # Python 依赖
     └── README.md                  # 项目说明
@@ -113,6 +122,17 @@
 | ---: | ---: | ---: | ---: |
 | 34,368 | 1,719 | 737 | 5.00% |
 
+## 智能报告与 API 安全
+
+智能报告页面需要用户手动输入 DeepSeek API Key。API Key：
+
+- 不写入代码、文件或 URL。
+- 不进入缓存或页面状态存储。
+- 只在用户点击“生成报告”时临时设置并使用。
+- 报告生成结束后清理临时环境变量。
+
+DeepSeek API 调用可能产生费用并受账户额度、请求频率和模型可用性限制。
+
 ## 数据说明
 
 当前演示数据包含以下主要字段：
@@ -136,6 +156,12 @@
 - YAML 配置化
 - 预测和异常模块从 YAML 读取配置
 
+## v0.3.0 开发中
+
+- 完成 DeepSeek API 底层调用和 API Key 环境变量接入。
+- 完成诊断 Agent、建议 Agent、报告 Agent 和完整报告编排。
+- 完成智能报告页面，并与异常事件及手动舒适度参数联动。
+
 ## 当前限制与使用说明
 
 - 当前统一数据中的 flow_rate、indoor_temp、humidity 为空。
@@ -147,12 +173,16 @@
 - 当前模型使用固定的一组 XGBoost 参数，尚未进行系统超参数搜索。
 - 分层评估用于观察不同负荷工况下的表现，不代表模型在所有运行条件下都达到相同效果。
 - 本项目迁移自三个独立的旧项目（异常检测、负荷预测、PMV 热舒适），旧项目代码仅作为迁移参考，不包含在本仓库中。
+- PMV 页面使用手动输入，因为当前统一数据中的 indoor_temp 和 humidity 为空；异常时段的 PMV 结果仅用于演示，不代表真实室内状态。
+- 智能报告内容仅供人工参考；Isolation Forest 异常标记不等于已确认故障。
+- 报告不会自动执行设备控制，所有建议必须由现场人员确认后执行。
+- 报告生成依赖外部 DeepSeek API，不保证服务持续可用，也不代表生产环境效果。
 
 由于数据中包含较多零负荷和低负荷样本，百分比误差指标对接近零的真实值非常敏感。因此，当前版本的主要模型指标使用 MAE、RMSE 和 R²，并结合不同热负荷区间的分层结果进行解读，不使用单一百分比误差指标判断模型效果。
 
 ## 版本路线
 
-- v1.0.0：接入大模型 Agent，生成异常诊断、运行建议和结构化运维报告。
+- v1.0.0：完整智能运维报告和平台整合。
 
 ## 免责声明
 

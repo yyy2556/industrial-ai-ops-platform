@@ -1,6 +1,7 @@
 """Streamlit page for heat-load backtesting and model interpretation."""
 
 from pathlib import Path
+import os
 import sys
 
 import matplotlib.pyplot as plt
@@ -24,6 +25,7 @@ from backend.feature_engineer import build_features
 from backend.forecast import evaluate_model, predict_model, train_model
 from backend.anomaly import detect_anomalies, merge_alerts, root_cause_analysis
 from backend.comfort import calculate_pmv
+from backend.agents import generate_full_report
 
 
 FEATURE_COLUMNS = [
@@ -173,6 +175,49 @@ def get_event_outdoor_temp(
         return fallback
     outdoor_temp = float(event_values.mean())
     return outdoor_temp if np.isfinite(outdoor_temp) else fallback
+
+
+def build_report_event_data(
+    data: pd.DataFrame,
+    event: pd.Series,
+) -> dict:
+    """Build a compact anomaly summary and scalar measurements for the agents."""
+    start_time = pd.to_datetime(event["起始时间"])
+    end_time = pd.to_datetime(event["结束时间"])
+    event_rows = data.loc[(data.index >= start_time) & (data.index <= end_time)]
+    measurement_columns = [
+        "supply_temp",
+        "return_temp",
+        "outdoor_temp",
+        "heat_load",
+        "delta_T",
+    ]
+    measurements = {}
+    for column in measurement_columns:
+        if column in event_rows.columns:
+            values = event_rows[column].dropna()
+            if not values.empty:
+                measurements[column] = float(values.mean())
+    return {
+        "start_time": event["起始时间"],
+        "end_time": event["结束时间"],
+        "duration_hours": float(str(event["持续时长"]).split()[0]),
+        "anomaly_count": int(event["异常点数"]),
+        "suspected_cause": event["疑似原因"] or "需要人工复核",
+        "measurements": measurements,
+    }
+
+
+def friendly_report_error(exc: Exception) -> str:
+    """Map common LLM failures to safe messages for the page."""
+    message = str(exc)
+    if "401" in message or "Key 无效" in message or "Key" in message and "无效" in message:
+        return "API Key 无效或已过期。"
+    if "超时" in message or "timeout" in message.lower():
+        return "请求超时，请稍后重试。"
+    if "429" in message or "额度" in message or "频率" in message:
+        return "API 当前不可用，请检查额度或稍后重试。"
+    return "报告生成失败，请检查 API 配置或稍后重试。"
 
 
 @st.cache_data
@@ -499,11 +544,121 @@ def render_comfort_page() -> None:
     st.caption("PMV/PPD 结果用于环境舒适度分析，不代表设备故障或安全判断。")
 
 
+def render_report_page() -> None:
+    """Render the manually triggered DeepSeek intelligent report page."""
+    st.title("智能报告")
+    st.info(
+        "当前统一数据中的 indoor_temp 和 humidity 为空，因此舒适度数据使用手动输入，仅用于演示。"
+    )
+    st.warning(
+        "生成报告会调用 DeepSeek API。诊断结果和运行建议仅供人工参考，不代表已确认设备故障，"
+        "也不会自动执行控制指令。"
+    )
+
+    api_key = st.text_input("DeepSeek API Key", type="password")
+    try:
+        data, event_table = load_anomaly_data()
+    except Exception as exc:
+        st.error(f"异常检测结果加载失败：{exc}")
+        return
+
+    if event_table.empty:
+        st.info("当前没有可用于生成报告的异常事件。")
+        return
+
+    event_options = [
+        format_event_option(index, event)
+        for index, (_, event) in enumerate(event_table.iterrows())
+    ]
+    selected_option = st.selectbox("选择异常事件", event_options, key="report_event_selection")
+    selected_index = event_options.index(selected_option)
+    selected_event = event_table.iloc[selected_index]
+    st.dataframe(
+        pd.DataFrame([selected_event.to_dict()]),
+        use_container_width=True,
+        hide_index=True,
+    )
+    selected_event_start = pd.to_datetime(selected_event["起始时间"])
+    selected_event_end = pd.to_datetime(selected_event["结束时间"])
+    historical_outdoor_temp = get_event_outdoor_temp(
+        data, selected_event_start, selected_event_end
+    )
+    st.caption(
+        f"异常事件室外温度（历史设备测量均值）：{historical_outdoor_temp:.1f}°C；"
+        "PMV 演示室外温度为下方手动输入值，两者不直接比较。"
+    )
+
+    st.subheader("手动舒适度参数")
+    comfort_inputs = st.columns(4)
+    report_indoor_temp = comfort_inputs[0].number_input(
+        "室内温度 (°C)", min_value=10.0, max_value=35.0, value=24.0, step=0.5, key="report_indoor_temp"
+    )
+    report_indoor_humidity = comfort_inputs[1].number_input(
+        "室内湿度 (%)", min_value=20.0, max_value=90.0, value=50.0, step=1.0, key="report_indoor_humidity"
+    )
+    report_outdoor_temp = comfort_inputs[2].number_input(
+        "室外温度 (°C)", min_value=-20.0, max_value=40.0, value=10.0, step=0.5, key="report_outdoor_temp"
+    )
+    report_air_speed = comfort_inputs[3].number_input(
+        "风速 (m/s)", min_value=0.0, max_value=2.0, value=0.1, step=0.05, key="report_air_speed"
+    )
+
+    if st.button("生成报告", type="primary", key="generate_report_button"):
+        if not api_key.strip():
+            st.warning("请输入 DeepSeek API Key 后再生成报告。")
+        else:
+            try:
+                comfort_result = calculate_pmv(
+                    indoor_temp=report_indoor_temp,
+                    indoor_humidity=report_indoor_humidity,
+                    outdoor_temp=report_outdoor_temp,
+                    air_speed=report_air_speed,
+                )
+                display_comfort_level = re.sub(
+                    r"^[+-]?d+s*", "", comfort_result["舒适度等级"]
+                )
+                comfort_data = {
+                    "pmv": comfort_result["PMV"],
+                    "ppd": comfort_result["PPD"],
+                    "comfort_level": display_comfort_level,
+                    "indoor_temp": report_indoor_temp,
+                    "indoor_humidity": report_indoor_humidity,
+                    "outdoor_temp": report_outdoor_temp,
+                    "air_speed": report_air_speed,
+                }
+                anomaly_data = build_report_event_data(data, selected_event)
+                os.environ["DEEPSEEK_API_KEY"] = api_key
+                try:
+                    with st.spinner("正在生成报告..."):
+                        result = generate_full_report(anomaly_data, comfort_data)
+                finally:
+                    os.environ.pop("DEEPSEEK_API_KEY", None)
+                st.session_state["full_report_result"] = result
+                st.session_state["full_report_event"] = selected_option
+            except Exception as exc:
+                st.error(friendly_report_error(exc))
+
+    stored_result = st.session_state.get("full_report_result")
+    stored_event = st.session_state.get("full_report_event")
+    if isinstance(stored_result, dict) and stored_event == selected_option:
+        st.caption("以下内容仅供人工参考，不代表已确认设备故障或自动控制指令。")
+        with st.expander("查看诊断摘要"):
+            st.write(stored_result.get("diagnosis", "未提供"))
+        with st.expander("查看运行建议"):
+            st.write(stored_result.get("suggestion", "未提供"))
+        st.subheader("完整运维报告")
+        st.write(stored_result.get("report", "未提供"))
+    elif isinstance(stored_result, dict):
+        st.info("当前选择的异常事件尚未生成报告，请点击“生成报告”。")
+
+
 st.set_page_config(page_title="工业 AI 运维平台", layout="wide")
-page = st.sidebar.radio("页面", ["负荷预测", "异常检测", "热舒适度"])
+page = st.sidebar.radio("页面", ["负荷预测", "异常检测", "热舒适度", "智能报告"])
 if page == "负荷预测":
     render_prediction_page()
 elif page == "异常检测":
     render_anomaly_page()
-else:
+elif page == "热舒适度":
     render_comfort_page()
+else:
+    render_report_page()
