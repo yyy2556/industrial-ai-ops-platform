@@ -1,11 +1,17 @@
 """Heat-load forecasting model utilities."""
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
+
+try:
+    from backend.config import load_profile
+except ModuleNotFoundError:
+    from config import load_profile
 
 
 DEFAULT_PARAMS = {
@@ -126,35 +132,46 @@ if __name__ == "__main__":
         from data_pipeline import clean_data, load_data, split_train_test
         from feature_engineer import build_features
 
-    data_path = "data/unified_data.csv"
+    project_root = Path(__file__).resolve().parents[1]
+    profile = load_profile("heat_exchange_station")
+    forecast_config = profile.get("forecast", {})
+    target_column = forecast_config.get("target")
+    feature_columns = forecast_config.get("feature_cols")
+    yaml_model_params = forecast_config.get("model_params", {})
+
+    if not isinstance(target_column, str) or not target_column:
+        raise ValueError("YAML forecast.target must be a non-empty string.")
+    if not isinstance(feature_columns, list) or not feature_columns:
+        raise ValueError("YAML forecast.feature_cols must be a non-empty list.")
+    if not isinstance(yaml_model_params, dict):
+        raise ValueError("YAML forecast.model_params must be a dictionary.")
+
+    data_path = project_root / "data" / "unified_data.csv"
     data = build_features(clean_data(load_data(data_path)))
-    feature_columns = [
-        "hour",
-        "day_of_week",
-        "month",
-        "is_weekend",
-        "heat_load_lag1",
-        "heat_load_lag24",
-        "heat_load_rolling_mean_24h",
-        "supply_temp_rolling_mean_24h",
-        "delta_T",
-        "outdoor_temp",
-        "supply_temp",
-        "return_temp",
-    ]
+
+    missing_features = [column for column in feature_columns if column not in data.columns]
+    if missing_features:
+        raise ValueError(f"YAML forecast feature columns are missing from data: {missing_features}")
+    if target_column not in data.columns:
+        raise ValueError(f"YAML forecast target column is missing from data: {target_column}")
+
+    model_params = {**DEFAULT_PARAMS, **yaml_model_params}
+    print(f"实际使用的目标列: {target_column}")
+    print(f"实际使用的特征列: {feature_columns}")
+    print(f"实际使用的模型参数: {model_params}")
 
     train_data, test_data = split_train_test(data)
     X_train = train_data[feature_columns]
-    y_train = train_data["heat_load"]
+    y_train = train_data[target_column]
     X_test = test_data[feature_columns]
-    y_test = test_data["heat_load"]
+    y_test = test_data[target_column]
 
     if X_train.isna().any().any() or X_test.isna().any().any():
         raise ValueError("Feature data contains NaN values; clean it before training.")
     if y_train.isna().any() or y_test.isna().any():
         raise ValueError("Target data contains NaN values; clean it before training.")
 
-    model = train_model(X_train, y_train)
+    model = train_model(X_train, y_train, params=model_params)
     predictions = predict_model(model, X_test)
     metrics = evaluate_model(y_test, predictions)
     print(f"MAE: {metrics['mae']:.6f}")
