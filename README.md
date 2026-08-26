@@ -1,6 +1,6 @@
 # 工业 AI 运维平台
 
-[![Version](https://img.shields.io/badge/version-v0.3.0--dev-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
+[![Version](https://img.shields.io/badge/version-v0.4.0-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 项目简介
@@ -11,7 +11,7 @@
 
 数据按照以下流程处理：
 
-数据文件 unified_data.csv -> 数据加载与清洗 -> 特征工程 -> XGBoost 热负荷预测 / Isolation Forest 异常检测 -> 原因分析、事件合并、评估与可解释性分析 -> Streamlit 多页面应用
+默认数据或用户上传 CSV -> 数据校验、清洗与特征工程 -> XGBoost 热负荷预测 / Isolation Forest 异常检测 -> 原因分析、事件合并、评估与可解释性分析 -> Streamlit 多页面应用
 
 异常事件 + 手动舒适度参数 -> 诊断 Agent -> 建议 Agent -> 报告 Agent -> 智能运维报告
 
@@ -38,6 +38,10 @@
 - 完整报告 Agent：整合诊断和建议，生成八章节智能运维报告。
 - 八章节智能运维报告：覆盖异常概况、判断、优先级、检查对象、观察时间、人工确认、禁止自动执行操作和限制说明。
 - Streamlit 智能报告页面：选择异常事件、填写手动舒适度参数并按需生成报告。
+- CSV 上传与字段校验：支持用户在页面上传数据，检查必需字段、时间戳、数值列和重复时间戳。
+- 上传数据接入业务页面：有效上传数据可用于负荷预测、异常检测和智能报告，未上传时使用默认演示数据。
+- SQLite 历史报告：保存报告生成时间、数据集签名、异常事件信息、诊断结果、运行建议和完整报告。
+- 历史报告查询：按当前数据集查看、选择和删除已生成的历史报告。
 - 当前页面明确标注为历史回测或手动演示，不将分析结果表述为真实未来预测或已确认故障。
 
 ## 快速开始
@@ -78,10 +82,10 @@
     │   └── config.py              # YAML 设备配置加载
     ├── config/
     │   └── device_profiles.yaml   # 换热站预测与异常检测配置
-    ├── data/
-    │   └── unified_data.csv       # 统一换热站演示数据
     ├── frontend/
-    │   └── app.py                 # 四页 Streamlit 应用
+    │   └── app.py                 # 五页 Streamlit 应用和上传入口
+    ├── data/
+    │   └── unified_data.csv       # 默认换热站演示数据；report_history.db 运行时生成且被忽略
     ├── notebooks/                 # 探索性分析目录
     ├── requirements.txt           # Python 依赖
     └── README.md                  # 项目说明
@@ -156,11 +160,18 @@ DeepSeek API 调用可能产生费用并受账户额度、请求频率和模型�
 - YAML 配置化
 - 预测和异常模块从 YAML 读取配置
 
-## v0.3.0 开发中
+## v0.3.0 已完成
 
 - 完成 DeepSeek API 底层调用和 API Key 环境变量接入。
 - 完成诊断 Agent、建议 Agent、报告 Agent 和完整报告编排。
 - 完成智能报告页面，并与异常事件及手动舒适度参数联动。
+
+## v0.4.0 已完成
+
+- CSV 上传与字段校验。
+- 上传数据接入负荷预测、异常检测和智能报告流程。
+- SQLite 历史报告存储、查询和删除。
+- 报告与数据集签名及异常事件绑定。
 
 ## 当前限制与使用说明
 
@@ -177,12 +188,14 @@ DeepSeek API 调用可能产生费用并受账户额度、请求频率和模型�
 - 智能报告内容仅供人工参考；Isolation Forest 异常标记不等于已确认故障。
 - 报告不会自动执行设备控制，所有建议必须由现场人员确认后执行。
 - 报告生成依赖外部 DeepSeek API，不保证服务持续可用，也不代表生产环境效果。
+- 历史报告数据库默认保存在本地 data/report_history.db，未配置云数据库时不保证公网重启后长期保留。
+- 公网多用户使用还需要补充用户身份认证、数据隔离、调用频率限制和云端持久化存储。
 
 由于数据中包含较多零负荷和低负荷样本，百分比误差指标对接近零的真实值非常敏感。因此，当前版本的主要模型指标使用 MAE、RMSE 和 R²，并结合不同热负荷区间的分层结果进行解读，不使用单一百分比误差指标判断模型效果。
 
 ## 版本路线
 
-- v1.0.0：完整智能运维报告和平台整合。
+- v1.0.0：公网可用版本，包括稳定部署、用户数据隔离、API 调用限制和持久化存储。
 
 ## 免责声明
 

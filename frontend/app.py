@@ -1,8 +1,11 @@
 """Streamlit page for heat-load backtesting and model interpretation."""
 
 from pathlib import Path
+import hashlib
+import io
 import os
 import sys
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -26,6 +29,7 @@ from backend.forecast import evaluate_model, predict_model, train_model
 from backend.anomaly import detect_anomalies, merge_alerts, root_cause_analysis
 from backend.comfort import calculate_pmv
 from backend.agents import generate_full_report
+from backend.report_store import delete_report, list_reports, save_report
 
 
 FEATURE_COLUMNS = [
@@ -43,18 +47,123 @@ FEATURE_COLUMNS = [
     "return_temp",
 ]
 
+REQUIRED_COLUMNS = [
+    "timestamp",
+    "outdoor_temp",
+    "supply_temp",
+    "return_temp",
+    "heat_load",
+]
+OPTIONAL_COLUMNS = [
+    "flow_rate",
+    "power_consumption",
+    "indoor_temp",
+    "humidity",
+]
+NUMERIC_COLUMNS = REQUIRED_COLUMNS[1:] + OPTIONAL_COLUMNS
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "unified_data.csv"
+
+
+def prepare_current_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Validate a CSV and return its cleaned, feature-engineered data."""
+    if not isinstance(raw_data, pd.DataFrame):
+        raise ValueError("上传内容不是有效的 CSV 数据。")
+    if raw_data.empty:
+        raise ValueError("CSV 数据为空，无法继续分析。")
+    if len(raw_data) < 2:
+        raise ValueError("CSV 数据行数不足，至少需要 2 行数据。")
+
+    missing_required = [column for column in REQUIRED_COLUMNS if column not in raw_data.columns]
+    if missing_required:
+        raise ValueError(f"缺少必需字段: {', '.join(missing_required)}")
+
+    data = raw_data.copy()
+    parsed_timestamp = pd.to_datetime(data["timestamp"], errors="coerce")
+    invalid_timestamp_count = int(parsed_timestamp.isna().sum())
+    if invalid_timestamp_count:
+        raise ValueError(f"timestamp 有 {invalid_timestamp_count} 个值无法转换为 datetime。")
+    data["timestamp"] = parsed_timestamp
+
+    for column in NUMERIC_COLUMNS:
+        if column not in data.columns:
+            continue
+        original = data[column]
+        converted = pd.to_numeric(original, errors="coerce")
+        non_empty = original.notna() & original.astype("string").str.strip().ne("")
+        invalid_count = int((non_empty & converted.isna()).sum())
+        if invalid_count:
+            raise ValueError(f"数值字段 {column} 有 {invalid_count} 个值无法转换为数值。")
+        data[column] = converted
+
+    empty_required = [
+        column for column in REQUIRED_COLUMNS[1:] if data[column].notna().sum() == 0
+    ]
+    if empty_required:
+        raise ValueError(f"必需数值字段完全为空: {', '.join(empty_required)}")
+
+    duplicate_count = int(data["timestamp"].duplicated(keep=False).sum())
+    warnings: list[str] = []
+    if duplicate_count:
+        warnings.append(f"检测到 {duplicate_count} 行重复时间戳，已保留重复行并继续处理。")
+
+    missing_optional = [column for column in OPTIONAL_COLUMNS if column not in data.columns]
+    if missing_optional:
+        warnings.append(f"缺少可选字段: {', '.join(missing_optional)}，相关功能将不可用。")
+        for column in missing_optional:
+            data[column] = np.nan
+
+    data = data.set_index("timestamp")
+    processed = build_features(clean_data(data))
+    return processed, warnings
+
+
+def set_current_data(
+    data: pd.DataFrame,
+    source: str,
+    signature: str,
+    dataset_name: str | None = None,
+) -> None:
+    """Store the current processed data in the active Streamlit session."""
+    st.session_state["current_data"] = data
+    st.session_state["current_data_source"] = source
+    st.session_state["current_data_signature"] = signature
+    st.session_state["current_data_name"] = dataset_name or source
+    st.session_state.pop("full_report_result", None)
+    st.session_state.pop("full_report_event", None)
+
+
+def ensure_default_data() -> None:
+    """Load the demo CSV once when the session has no current data."""
+    if "current_data" in st.session_state:
+        return
+    if not DEFAULT_DATA_PATH.is_file():
+        raise FileNotFoundError(f"默认演示数据不存在: {DEFAULT_DATA_PATH}")
+    raw_data = pd.read_csv(DEFAULT_DATA_PATH)
+    processed, warnings = prepare_current_data(raw_data)
+    stat = DEFAULT_DATA_PATH.stat()
+    signature = f"default:{stat.st_mtime_ns}:{stat.st_size}"
+    set_current_data(processed, "默认演示数据", signature, DEFAULT_DATA_PATH.name)
+    st.session_state["current_data_warnings"] = warnings
+
+
+def get_current_data() -> tuple[pd.DataFrame, str]:
+    """Return current session data and its cache signature."""
+    ensure_default_data()
+    return st.session_state["current_data"], st.session_state["current_data_signature"]
+
 
 @st.cache_data
-def load_feature_data() -> pd.DataFrame:
-    """Load, clean, and feature-engineer the shared time-series table."""
-    data = load_data(PROJECT_ROOT / "data" / "unified_data.csv")
-    return build_features(clean_data(data))
+def load_feature_data(data_signature: str, _data: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of the session data keyed by its current signature."""
+    return _data.copy()
 
 
 @st.cache_resource
-def load_and_train():
+def load_and_train(data_signature: str, _data: pd.DataFrame):
     """Load data and train once per Streamlit cache key."""
-    data = load_feature_data()
+    data = load_feature_data(data_signature, _data)
+    if len(data) < 25:
+        raise ValueError("当前数据行数不足，无法可靠构造 lag24 特征或完成时间切分，至少需要 25 行。")
     train_data, test_data = split_train_test(data)
 
     X_train = train_data[FEATURE_COLUMNS]
@@ -220,10 +329,64 @@ def friendly_report_error(exc: Exception) -> str:
     return "报告生成失败，请检查 API 配置或稍后重试。"
 
 
+def render_report_history(data_signature: str) -> None:
+    """Render current-dataset report history with view and delete actions."""
+    st.subheader("历史报告")
+    try:
+        reports = list_reports(dataset_signature=data_signature)
+    except Exception as exc:
+        st.error(f"历史报告读取失败：{exc}")
+        return
+
+    if not reports:
+        st.info("暂无历史报告")
+        return
+
+    history_table = pd.DataFrame(
+        [
+            {
+                "生成时间": item["created_at"],
+                "数据集名称": item["dataset_name"],
+                "异常事件时间": f"{item['event_start_time']} 至 {item['event_end_time']}",
+                "异常原因": item["suspected_cause"],
+            }
+            for item in reports
+        ]
+    )
+    st.dataframe(history_table, use_container_width=True, hide_index=True)
+
+    option_labels = [
+        f"{item['created_at']} | {item['event_start_time']} | "
+        f"{item['suspected_cause']} | 报告 ID {item['id']}"
+        for item in reports
+    ]
+    selected_index = st.selectbox(
+        "选择历史报告",
+        range(len(reports)),
+        format_func=lambda index: option_labels[index],
+        key=f"history_report_selection_{data_signature}",
+    )
+    selected_report = reports[selected_index]
+    st.markdown("**诊断结果**")
+    st.write(selected_report["diagnosis"])
+    st.markdown("**运行建议**")
+    st.write(selected_report["suggestion"])
+    st.markdown("**完整运维报告**")
+    st.write(selected_report["report"])
+    if st.button("删除选中的历史报告", key="delete_history_report"):
+        try:
+            if delete_report(int(selected_report["id"])):
+                st.session_state["history_report_notice"] = "历史报告已删除。"
+                st.rerun()
+            st.warning("未找到要删除的历史报告。")
+        except Exception as exc:
+            st.error(f"历史报告删除失败：{exc}")
+
+
 @st.cache_data
-def load_anomaly_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_anomaly_data(data_signature: str, _data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load, detect, label, and group anomalies using Streamlit data cache."""
-    data = load_feature_data().copy()
+    data = load_feature_data(data_signature, _data).copy()
     if not isinstance(data.index, pd.DatetimeIndex):
         converted_index = pd.to_datetime(data.index, errors="coerce")
         if converted_index.isna().any():
@@ -235,6 +398,49 @@ def load_anomaly_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     events = merge_alerts(data)
     event_table = summarize_event_causes(data, events)
     return data, event_table
+
+
+def render_upload_page() -> None:
+    """Render CSV upload, schema validation, and data preview."""
+    st.title("数据上传")
+    st.caption("上传有效 CSV 后，本次会话中的业务页面将使用该数据；文件不会写入项目目录。")
+    uploaded_file = st.file_uploader("上传 CSV 文件", type=["csv"])
+
+    ensure_default_data()
+    if uploaded_file is None:
+        if st.session_state.get("current_data_source") != "默认演示数据":
+            raw_data = pd.read_csv(DEFAULT_DATA_PATH)
+            processed, warnings = prepare_current_data(raw_data)
+            stat = DEFAULT_DATA_PATH.stat()
+            signature = f"default:{stat.st_mtime_ns}:{stat.st_size}"
+            set_current_data(processed, "默认演示数据", signature, DEFAULT_DATA_PATH.name)
+            st.session_state["current_data_warnings"] = warnings
+    else:
+        file_bytes = uploaded_file.getvalue()
+        signature = f"upload:{hashlib.sha256(file_bytes).hexdigest()}"
+        if st.session_state.get("current_data_signature") != signature:
+            try:
+                raw_data = pd.read_csv(io.BytesIO(file_bytes))
+                processed, warnings = prepare_current_data(raw_data)
+                set_current_data(processed, "用户上传数据", signature, uploaded_file.name)
+                st.session_state["current_data_warnings"] = warnings
+                st.success("CSV 校验和数据处理成功，已切换到用户上传数据。")
+            except Exception as exc:
+                st.error(f"CSV 校验失败：{exc}")
+
+    data, _ = get_current_data()
+    source = st.session_state.get("current_data_source", "默认演示数据")
+    st.info(f"当前使用{source}")
+    for warning in st.session_state.get("current_data_warnings", []):
+        st.warning(warning)
+
+    st.subheader("数据概览")
+    overview = st.columns(2)
+    overview[0].metric("数据行数", f"{len(data):,}")
+    overview[1].metric("字段数量", f"{len(data.columns):,}")
+    st.write("当前列名：", ", ".join(map(str, data.columns)))
+    st.subheader("前 10 行预览")
+    st.dataframe(data.head(10), use_container_width=True)
 
 
 def build_anomaly_timeseries(data: pd.DataFrame) -> go.Figure:
@@ -287,7 +493,8 @@ def render_anomaly_page() -> None:
         "不直接作为设备故障判决依据。"
     )
     try:
-        data, event_table = load_anomaly_data()
+        current_data, data_signature = get_current_data()
+        data, event_table = load_anomaly_data(data_signature, current_data)
     except Exception as exc:
         st.error(f"异常检测页面加载失败：{exc}")
         return
@@ -331,7 +538,11 @@ def render_anomaly_page() -> None:
             format_event_option(index, event)
             for index, (_, event) in enumerate(event_table.iterrows())
         ]
-        selected_event_option = st.selectbox("选择异常事件", event_options)
+        selected_event_option = st.selectbox(
+            "选择异常事件",
+            event_options,
+            key=f"anomaly_comfort_event_{data_signature}",
+        )
         selected_event_index = event_options.index(selected_event_option)
         selected_event = event_table.iloc[selected_event_index]
         selected_start = pd.to_datetime(selected_event["起始时间"])
@@ -409,7 +620,10 @@ def render_prediction_page() -> None:
     """Render the existing heat-load prediction backtest page."""
     st.title("热负荷预测回测与评估")
     try:
-        model, X_test, y_test, y_pred, metrics, total_count, train_count = load_and_train()
+        current_data, data_signature = get_current_data()
+        model, X_test, y_test, y_pred, metrics, total_count, train_count = load_and_train(
+            data_signature, current_data
+        )
     except Exception as exc:
         st.error(f"页面加载失败：{exc}")
         return
@@ -557,20 +771,26 @@ def render_report_page() -> None:
 
     api_key = st.text_input("DeepSeek API Key", type="password")
     try:
-        data, event_table = load_anomaly_data()
+        current_data, data_signature = get_current_data()
+        data, event_table = load_anomaly_data(data_signature, current_data)
     except Exception as exc:
         st.error(f"异常检测结果加载失败：{exc}")
         return
 
     if event_table.empty:
         st.info("当前没有可用于生成报告的异常事件。")
+        render_report_history(data_signature)
         return
 
     event_options = [
         format_event_option(index, event)
         for index, (_, event) in enumerate(event_table.iterrows())
     ]
-    selected_option = st.selectbox("选择异常事件", event_options, key="report_event_selection")
+    selected_option = st.selectbox(
+        "选择异常事件",
+        event_options,
+        key=f"report_event_selection_{data_signature}",
+    )
     selected_index = event_options.index(selected_option)
     selected_event = event_table.iloc[selected_index]
     st.dataframe(
@@ -615,7 +835,7 @@ def render_report_page() -> None:
                     air_speed=report_air_speed,
                 )
                 display_comfort_level = re.sub(
-                    r"^[+-]?d+s*", "", comfort_result["舒适度等级"]
+                    r"^[+-]?\d+\s*", "", comfort_result["舒适度等级"]
                 )
                 comfort_data = {
                     "pmv": comfort_result["PMV"],
@@ -635,6 +855,27 @@ def render_report_page() -> None:
                     os.environ.pop("DEEPSEEK_API_KEY", None)
                 st.session_state["full_report_result"] = result
                 st.session_state["full_report_event"] = selected_option
+                try:
+                    save_report(
+                        {
+                            "dataset_signature": data_signature,
+                            "dataset_name": st.session_state.get(
+                                "current_data_name",
+                                st.session_state.get("current_data_source", "未命名数据集"),
+                            ),
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "event_start_time": anomaly_data["start_time"],
+                            "event_end_time": anomaly_data["end_time"],
+                            "duration_hours": anomaly_data["duration_hours"],
+                            "anomaly_count": anomaly_data["anomaly_count"],
+                            "suspected_cause": anomaly_data["suspected_cause"],
+                            "diagnosis": result["diagnosis"],
+                            "suggestion": result["suggestion"],
+                            "report": result["report"],
+                        }
+                    )
+                except Exception as exc:
+                    st.warning(f"报告已生成，但历史报告保存失败：{exc}")
             except Exception as exc:
                 st.error(friendly_report_error(exc))
 
@@ -651,10 +892,17 @@ def render_report_page() -> None:
     elif isinstance(stored_result, dict):
         st.info("当前选择的异常事件尚未生成报告，请点击“生成报告”。")
 
+    render_report_history(data_signature)
+
 
 st.set_page_config(page_title="工业 AI 运维平台", layout="wide")
-page = st.sidebar.radio("页面", ["负荷预测", "异常检测", "热舒适度", "智能报告"])
-if page == "负荷预测":
+page = st.sidebar.radio("页面", ["数据上传", "负荷预测", "异常检测", "热舒适度", "智能报告"])
+if page == "数据上传":
+    try:
+        render_upload_page()
+    except Exception as exc:
+        st.error(f"数据页面加载失败：{exc}")
+elif page == "负荷预测":
     render_prediction_page()
 elif page == "异常检测":
     render_anomaly_page()
