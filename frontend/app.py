@@ -6,6 +6,7 @@ import io
 import os
 import sys
 from datetime import datetime
+from datetime import timedelta
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -29,6 +30,7 @@ from backend.forecast import evaluate_model, predict_model, train_model
 from backend.anomaly import detect_anomalies, merge_alerts, root_cause_analysis
 from backend.comfort import calculate_pmv
 from backend.agents import generate_full_report
+from backend.auth import authenticate_user
 from backend.report_store import delete_report, list_reports, save_report
 
 
@@ -62,6 +64,10 @@ OPTIONAL_COLUMNS = [
 ]
 NUMERIC_COLUMNS = REQUIRED_COLUMNS[1:] + OPTIONAL_COLUMNS
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "unified_data.csv"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_ROWS = 200_000
+CACHE_TTL = timedelta(days=3)
+CACHE_MAX_ENTRIES = 5
 
 
 def prepare_current_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -72,6 +78,8 @@ def prepare_current_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, list[str
         raise ValueError("CSV 数据为空，无法继续分析。")
     if len(raw_data) < 2:
         raise ValueError("CSV 数据行数不足，至少需要 2 行数据。")
+    if len(raw_data) > MAX_UPLOAD_ROWS:
+        raise ValueError(f"CSV 行数超过限制，最多支持 {MAX_UPLOAD_ROWS:,} 行。")
 
     missing_required = [column for column in REQUIRED_COLUMNS if column not in raw_data.columns]
     if missing_required:
@@ -152,13 +160,13 @@ def get_current_data() -> tuple[pd.DataFrame, str]:
     return st.session_state["current_data"], st.session_state["current_data_signature"]
 
 
-@st.cache_data
+@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
 def load_feature_data(data_signature: str, _data: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of the session data keyed by its current signature."""
     return _data.copy()
 
 
-@st.cache_resource
+@st.cache_resource(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
 def load_and_train(data_signature: str, _data: pd.DataFrame):
     """Load data and train once per Streamlit cache key."""
     data = load_feature_data(data_signature, _data)
@@ -180,7 +188,7 @@ def load_and_train(data_signature: str, _data: pd.DataFrame):
     return model, X_test, y_test, y_pred, evaluate_model(y_test, y_pred), len(data), len(train_data)
 
 
-@st.cache_resource
+@st.cache_resource(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
 def make_shap_explanation(_model, X_test: pd.DataFrame):
     """Explain at most 1,000 test rows to keep page rendering responsive."""
     X_sample = X_test.iloc[:1000]
@@ -329,11 +337,28 @@ def friendly_report_error(exc: Exception) -> str:
     return "报告生成失败，请检查 API 配置或稍后重试。"
 
 
-def render_report_history(data_signature: str) -> None:
+def report_markdown(report_data: dict, dataset_name: str, event_label: str) -> str:
+    """Build a portable Markdown report for local download."""
+    report = report_data.get("report", "未提供")
+    return (
+        f"# 工业 AI 运维报告\n\n"
+        f"- 生成日期：{datetime.now().strftime('%Y-%m-%d')}\n"
+        f"- 数据集：{dataset_name}\n"
+        f"- 异常事件：{event_label}\n\n"
+        "## 诊断摘要\n\n"
+        f"{report_data.get('diagnosis', '未提供')}\n\n"
+        "## 运行建议\n\n"
+        f"{report_data.get('suggestion', '未提供')}\n\n"
+        "## 完整运维报告\n\n"
+        f"{report}\n"
+    )
+
+
+def render_report_history(user_id: str, data_signature: str) -> None:
     """Render current-dataset report history with view and delete actions."""
     st.subheader("历史报告")
     try:
-        reports = list_reports(dataset_signature=data_signature)
+        reports = list_reports(user_id=user_id, dataset_signature=data_signature)
     except Exception as exc:
         st.error(f"历史报告读取失败：{exc}")
         return
@@ -373,9 +398,20 @@ def render_report_history(data_signature: str) -> None:
     st.write(selected_report["suggestion"])
     st.markdown("**完整运维报告**")
     st.write(selected_report["report"])
+    st.download_button(
+        "下载 Markdown 报告",
+        data=report_markdown(
+            selected_report,
+            selected_report["dataset_name"],
+            f"{selected_report['event_start_time']} 至 {selected_report['event_end_time']}",
+        ),
+        file_name=f"industrial_ops_report_{datetime.now().strftime('%Y-%m-%d')}.md",
+        mime="text/markdown",
+        key=f"download_history_report_{selected_report['id']}",
+    )
     if st.button("删除选中的历史报告", key="delete_history_report"):
         try:
-            if delete_report(int(selected_report["id"])):
+            if delete_report(int(selected_report["id"]), user_id=user_id):
                 st.session_state["history_report_notice"] = "历史报告已删除。"
                 st.rerun()
             st.warning("未找到要删除的历史报告。")
@@ -383,7 +419,7 @@ def render_report_history(data_signature: str) -> None:
             st.error(f"历史报告删除失败：{exc}")
 
 
-@st.cache_data
+@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
 def load_anomaly_data(data_signature: str, _data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load, detect, label, and group anomalies using Streamlit data cache."""
     data = load_feature_data(data_signature, _data).copy()
@@ -420,6 +456,8 @@ def render_upload_page() -> None:
         signature = f"upload:{hashlib.sha256(file_bytes).hexdigest()}"
         if st.session_state.get("current_data_signature") != signature:
             try:
+                if len(file_bytes) > MAX_UPLOAD_BYTES:
+                    raise ValueError("CSV 文件超过限制，最大支持 20MB。")
                 raw_data = pd.read_csv(io.BytesIO(file_bytes))
                 processed, warnings = prepare_current_data(raw_data)
                 set_current_data(processed, "用户上传数据", signature, uploaded_file.name)
@@ -779,7 +817,10 @@ def render_report_page() -> None:
 
     if event_table.empty:
         st.info("当前没有可用于生成报告的异常事件。")
-        render_report_history(data_signature)
+        if st.session_state.get("authenticated"):
+            render_report_history(st.session_state["user_id"], data_signature)
+        else:
+            st.info("未登录状态不会保存历史报告；如需查看历史报告，请从左侧登录。")
         return
 
     event_options = [
@@ -855,27 +896,29 @@ def render_report_page() -> None:
                     os.environ.pop("DEEPSEEK_API_KEY", None)
                 st.session_state["full_report_result"] = result
                 st.session_state["full_report_event"] = selected_option
-                try:
-                    save_report(
-                        {
-                            "dataset_signature": data_signature,
-                            "dataset_name": st.session_state.get(
-                                "current_data_name",
-                                st.session_state.get("current_data_source", "未命名数据集"),
-                            ),
-                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "event_start_time": anomaly_data["start_time"],
-                            "event_end_time": anomaly_data["end_time"],
-                            "duration_hours": anomaly_data["duration_hours"],
-                            "anomaly_count": anomaly_data["anomaly_count"],
-                            "suspected_cause": anomaly_data["suspected_cause"],
-                            "diagnosis": result["diagnosis"],
-                            "suggestion": result["suggestion"],
-                            "report": result["report"],
-                        }
-                    )
-                except Exception as exc:
-                    st.warning(f"报告已生成，但历史报告保存失败：{exc}")
+                if st.session_state.get("authenticated"):
+                    try:
+                        save_report(
+                            {
+                                "user_id": st.session_state["user_id"],
+                                "dataset_signature": data_signature,
+                                "dataset_name": st.session_state.get(
+                                    "current_data_name",
+                                    st.session_state.get("current_data_source", "未命名数据集"),
+                                ),
+                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "event_start_time": anomaly_data["start_time"],
+                                "event_end_time": anomaly_data["end_time"],
+                                "duration_hours": anomaly_data["duration_hours"],
+                                "anomaly_count": anomaly_data["anomaly_count"],
+                                "suspected_cause": anomaly_data["suspected_cause"],
+                                "diagnosis": result["diagnosis"],
+                                "suggestion": result["suggestion"],
+                                "report": result["report"],
+                            }
+                        )
+                    except Exception as exc:
+                        st.warning(f"报告已生成，但历史报告保存失败：{exc}")
             except Exception as exc:
                 st.error(friendly_report_error(exc))
 
@@ -888,14 +931,76 @@ def render_report_page() -> None:
         with st.expander("查看运行建议"):
             st.write(stored_result.get("suggestion", "未提供"))
         st.subheader("完整运维报告")
-        st.write(stored_result.get("report", "未提供"))
+        report_text = stored_result.get("report", "未提供")
+        st.write(report_text)
+        st.download_button(
+            "下载 Markdown 报告",
+            data=report_markdown(
+                stored_result,
+                st.session_state.get("current_data_name", "未命名数据集"),
+                selected_option,
+            ),
+            file_name=f"industrial_ops_report_{datetime.now().strftime('%Y-%m-%d')}.md",
+            mime="text/markdown",
+            key=f"download_current_report_{data_signature}",
+        )
     elif isinstance(stored_result, dict):
         st.info("当前选择的异常事件尚未生成报告，请点击“生成报告”。")
 
-    render_report_history(data_signature)
+    if st.session_state.get("authenticated"):
+        render_report_history(st.session_state["user_id"], data_signature)
+    else:
+        st.info("未登录状态不会保存历史报告；当前报告仍可查看和下载。需要历史报告时，请从左侧登录。")
 
 
 st.set_page_config(page_title="工业 AI 运维平台", layout="wide")
+
+
+def render_login() -> None:
+    """Render the demo login gate."""
+    st.title("工业 AI 运维平台")
+    st.subheader("登录")
+    st.caption("当前为演示登录系统，账号仅用于区分各自的历史报告。")
+    with st.form("login_form"):
+        username = st.text_input("用户名")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", type="primary")
+    st.info("演示账号：demo / demo123；admin / admin123")
+    if st.button("返回应用", key="back_to_app_button"):
+        st.session_state["show_login"] = False
+        st.rerun()
+    if submitted:
+        user = authenticate_user(username, password)
+        if user is None:
+            st.error("用户名或密码错误。")
+        else:
+            st.session_state["authenticated"] = True
+            st.session_state["user_id"] = user["user_id"]
+            st.session_state["display_name"] = user["display_name"]
+            st.session_state["show_login"] = False
+            st.rerun()
+
+
+if st.session_state.get("show_login"):
+    render_login()
+    st.stop()
+
+with st.sidebar:
+    if st.session_state.get("authenticated"):
+        st.caption(f"当前用户：{st.session_state.get('display_name', st.session_state['user_id'])}")
+        if st.button("退出登录", key="logout_button"):
+            st.session_state.pop("authenticated", None)
+            st.session_state.pop("user_id", None)
+            st.session_state.pop("display_name", None)
+            st.session_state.pop("full_report_result", None)
+            st.session_state.pop("full_report_event", None)
+            st.rerun()
+    else:
+        st.caption("当前为访客模式")
+        if st.button("登录", key="login_button"):
+            st.session_state["show_login"] = True
+            st.rerun()
+
 page = st.sidebar.radio("页面", ["数据上传", "负荷预测", "异常检测", "热舒适度", "智能报告"])
 if page == "数据上传":
     try:
