@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import datetime
 from datetime import timedelta
+from datetime import date
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -159,7 +160,79 @@ def ensure_default_data() -> None:
 def get_current_data() -> tuple[pd.DataFrame, str]:
     """Return current session data and its cache signature."""
     ensure_default_data()
-    return st.session_state["current_data"], st.session_state["current_data_signature"]
+    data = st.session_state["current_data"]
+    signature = st.session_state["current_data_signature"]
+    # Other pages reuse the range selected on Overview while retaining full-history features.
+    if st.session_state.get("apply_time_filter") and st.session_state.get("time_filter") not in (None, "全部时间"):
+        _, active_signature, active = get_active_data()
+        return active, active_signature
+    return data, signature
+
+
+def get_time_filter(data: pd.DataFrame) -> tuple[pd.DataFrame, str, tuple[pd.Timestamp, pd.Timestamp] | None]:
+    """Render/read the shared range and return a filtered view.
+
+    Features are built before this slice, so lag24 and rolling values retain full-history context.
+    """
+    if data.empty or not isinstance(data.index, pd.DatetimeIndex):
+        return data, "all", None
+    data_start = pd.Timestamp(data.index.min()).normalize()
+    data_end = pd.Timestamp(data.index.max()).normalize()
+    options = ["全部时间", "今日", "近 7 天", "近 30 天", "自定义时间范围"]
+    current = st.session_state.get("time_filter", "全部时间")
+    if current not in options:
+        current = "全部时间"
+    selected = st.selectbox("时间范围", options, index=options.index(current), key="time_filter")
+    start_date, end_date = data_start.date(), data_end.date()
+    if selected == "今日":
+        start_date = end_date
+    elif selected == "近 7 天":
+        start_date = max(data_start.date(), (data_end - pd.Timedelta(days=6)).date())
+    elif selected == "近 30 天":
+        start_date = max(data_start.date(), (data_end - pd.Timedelta(days=29)).date())
+    elif selected == "自定义时间范围":
+        saved = st.session_state.get("custom_time_range", (data_start.date(), data_end.date()))
+        custom = st.date_input("自定义日期", value=saved, min_value=data_start.date(), max_value=data_end.date(), key="custom_time_range")
+        if isinstance(custom, (tuple, list)) and len(custom) == 2:
+            start_date, end_date = custom
+        else:
+            st.info("请选择起止日期后应用时间范围。")
+            return data, f"{selected}:pending", None
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    filtered = data.loc[(data.index >= start) & (data.index <= end)]
+    range_key = f"{selected}:{start.date()}:{end.date()}"
+    st.caption(f"当前时间范围：{start.strftime('%Y-%m-%d')} 至 {end.strftime('%Y-%m-%d')} · {len(filtered):,} 行")
+    if filtered.empty:
+        st.warning("当前时间范围内没有数据，请扩大时间范围。")
+    return filtered, range_key, (start, end)
+
+
+def get_active_data() -> tuple[pd.DataFrame, str, pd.DataFrame]:
+    """Return full data, active range signature, and the active display view."""
+    ensure_default_data()
+    full_data = st.session_state["current_data"]
+    signature = st.session_state["current_data_signature"]
+    # The filter is rendered on the overview; other pages reuse the saved range.
+    selected = st.session_state.get("time_filter", "全部时间")
+    if selected == "全部时间":
+        return full_data, f"{signature}:all", full_data
+    data_start = pd.Timestamp(full_data.index.min()).normalize()
+    data_end = pd.Timestamp(full_data.index.max()).normalize()
+    if selected == "今日":
+        start_date = end_date = data_end.date()
+    elif selected == "近 7 天":
+        start_date, end_date = max(data_start.date(), (data_end - pd.Timedelta(days=6)).date()), data_end.date()
+    elif selected == "近 30 天":
+        start_date, end_date = max(data_start.date(), (data_end - pd.Timedelta(days=29)).date()), data_end.date()
+    else:
+        custom = st.session_state.get("custom_time_range", (data_start.date(), data_end.date()))
+        if not isinstance(custom, (tuple, list)) or len(custom) != 2:
+            return full_data, f"{signature}:all", full_data
+        start_date, end_date = custom
+    start, end = pd.Timestamp(start_date), pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    active = full_data.loc[(full_data.index >= start) & (full_data.index <= end)]
+    return full_data, f"{signature}:{selected}:{start.date()}:{end.date()}", active
 
 
 @st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
@@ -380,7 +453,7 @@ def render_report_history(user_id: str, data_signature: str) -> None:
             for item in reports
         ]
     )
-    st.dataframe(history_table, use_container_width=True, hide_index=True)
+    render_readonly_dataframe(history_table, use_container_width=True, hide_index=True)
 
     option_labels = [
         f"{item['created_at']} | {item['event_start_time']} | "
@@ -450,6 +523,15 @@ def render_page_header(title: str, description: str, eyebrow: str = "OPERATIONS 
     )
 
 
+def render_readonly_dataframe(data: pd.DataFrame, **kwargs):
+    """Render a non-editable table so double-click never opens a cell editor."""
+    config = kwargs.pop("column_config", None) or {
+        column: st.column_config.TextColumn(disabled=True)
+        for column in getattr(data, "columns", [])
+    }
+    return st.dataframe(data, column_config=config, **kwargs)
+
+
 def render_overview_page() -> None:
     """Render the first-screen operations cockpit."""
     render_page_header(
@@ -491,7 +573,7 @@ def render_overview_page() -> None:
             st.success("当前数据未生成异常事件")
         else:
             st.warning(f"检测到 {event_count} 个待关注事件")
-            st.dataframe(event_table.head(4)[["起始时间", "持续时长", "异常点数", "疑似原因"]], use_container_width=True, hide_index=True)
+            render_readonly_dataframe(event_table.head(4)[["起始时间", "持续时长", "异常点数", "疑似原因"]], use_container_width=True, hide_index=True)
 
     st.markdown("### AI 运维分析")
     status_text = "当前系统整体运行稳定，可继续关注异常事件变化。" if anomaly_count == 0 else f"当前检测到 {event_count} 个异常事件，建议优先核查高频异常时段及相关设备测点。"
@@ -540,7 +622,7 @@ def render_upload_page() -> None:
     overview[1].metric("字段数量", f"{len(data.columns):,}")
     st.write("当前列名：", ", ".join(map(str, data.columns)))
     st.subheader("前 10 行预览")
-    st.dataframe(data.head(10), use_container_width=True)
+    render_readonly_dataframe(data.head(10), use_container_width=True)
 
 
 def build_anomaly_timeseries(data: pd.DataFrame) -> go.Figure:
@@ -594,6 +676,8 @@ def render_anomaly_page() -> None:
     )
     try:
         current_data, data_signature = get_current_data()
+        if st.session_state.get("apply_time_filter"):
+            _, data_signature, current_data = get_active_data()
         data, event_table = load_anomaly_data(data_signature, current_data)
     except Exception as exc:
         st.error(f"异常检测页面加载失败：{exc}")
@@ -621,30 +705,64 @@ def render_anomaly_page() -> None:
         filtered_events = event_table
     else:
         filtered_events = event_table[event_table["疑似原因"] == selected_cause]
+    selected_event = None
+    selected_label = None
     if filtered_events.empty:
         st.info("暂无异常事件")
     else:
-        st.dataframe(filtered_events, use_container_width=True, hide_index=True)
+        event_labels = [format_event_option(i, event) for i, (_, event) in enumerate(filtered_events.iterrows())]
+        event_table_state = st.dataframe(
+            filtered_events,
+            use_container_width=True,
+            hide_index=True,
+            key="anomaly_events_table",
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+        selected_rows = getattr(getattr(event_table_state, "selection", None), "rows", [])
+        if selected_rows:
+            selected_row = int(selected_rows[0])
+            if 0 <= selected_row < len(event_labels):
+                st.session_state["anomaly_detail_event"] = event_labels[selected_row]
+        selected_label = st.selectbox("选择异常事件查看详情", event_labels, key="anomaly_detail_event")
+        selected_event = filtered_events.iloc[event_labels.index(selected_label)]
+        event_key = f"{selected_event['起始时间']}|{selected_event['结束时间']}|{selected_event['异常点数']}"
+        focused_events = st.session_state.setdefault("focused_events", set())
+        resolved_events = st.session_state.setdefault("resolved_events", set())
+        false_positive_events = st.session_state.setdefault("false_positive_events", set())
+        st.markdown("#### 异常详情")
+        st.write(f"起始时间：{selected_event['起始时间']} · 结束时间：{selected_event['结束时间']} · 持续时长：{selected_event['持续时长']}")
+        st.write(f"异常点数量：{selected_event['异常点数']} · 疑似原因：{selected_event['疑似原因']}")
+        st.caption("模型风险等级：演示规则（需人工复核） · 检测算法：Isolation Forest · 当前数据未提供设备标识")
+        action_cols = st.columns(4)
+        if action_cols[0].button("加入重点关注", key="flag_event"):
+            focused_events.add(event_key)
+        if action_cols[1].button("标记已处理", key="resolve_event"):
+            resolved_events.add(event_key)
+        if action_cols[2].button("标记误报", key="false_positive_event"):
+            false_positive_events.add(event_key)
+        state_tags = []
+        if event_key in focused_events: state_tags.append("重点关注")
+        if event_key in resolved_events: state_tags.append("已处理")
+        if event_key in false_positive_events: state_tags.append("误报")
+        if state_tags:
+            st.caption(f"当前会话状态：{'、'.join(state_tags)}")
+        if action_cols[3].button("进入报告输出", key="event_to_report"):
+            st.session_state["pending_page"] = "报告输出"
+            st.session_state["report_event_selection"] = selected_label
+            st.rerun()
 
     st.subheader("异常时段热舒适风险")
     st.info(
         "当前数据缺少室内温度和室内湿度，因此以下 PMV 结果使用手动输入参数，"
         "仅用于演示异常时段的热舒适度评估。"
     )
-    if event_table.empty:
+    if selected_event is None:
         st.info("暂无异常事件，暂时跳过 PMV 联动。")
     else:
-        event_options = [
-            format_event_option(index, event)
-            for index, (_, event) in enumerate(event_table.iterrows())
-        ]
-        selected_event_option = st.selectbox(
-            "选择异常事件",
-            event_options,
-            key=f"anomaly_comfort_event_{data_signature}",
-        )
-        selected_event_index = event_options.index(selected_event_option)
-        selected_event = event_table.iloc[selected_event_index]
+        # Reuse the single event selector above so details and PMV stay in sync.
+        selected_event_option = selected_label
+        selected_event_index = event_table.index.get_loc(selected_event.name)
         selected_start = pd.to_datetime(selected_event["起始时间"])
         selected_end = pd.to_datetime(selected_event["结束时间"])
         event_outdoor_temp = get_event_outdoor_temp(data, selected_start, selected_end)
@@ -721,6 +839,8 @@ def render_prediction_page() -> None:
     render_page_header("负荷预测", "通过历史回测评估热负荷模型表现与特征贡献", "INTELLIGENCE / FORECAST")
     try:
         current_data, data_signature = get_current_data()
+        if st.session_state.get("apply_time_filter"):
+            _, data_signature, current_data = get_active_data()
         model, X_test, y_test, y_pred, metrics, total_count, train_count = load_and_train(
             data_signature, current_data
         )
@@ -796,7 +916,7 @@ def render_prediction_page() -> None:
         {"阈值": "≥20", "样本数": 2054, "MAE": 24.560956, "RMSE": 40.006190, "R²": 0.590393, "MAPE": "28.908335%"},
         {"阈值": "≥30", "样本数": 1938, "MAE": 25.334219, "RMSE": 40.775659, "R²": 0.534735, "MAPE": "27.875403%"},
     ])
-    st.dataframe(threshold_table.style.format({"MAE": "{:.4f}", "RMSE": "{:.4f}", "R²": "{:.4f}"}), use_container_width=True, hide_index=True)
+    render_readonly_dataframe(threshold_table.style.format({"MAE": "{:.4f}", "RMSE": "{:.4f}", "R²": "{:.4f}"}), use_container_width=True, hide_index=True)
     st.caption("本页面为回测模式，使用历史数据验证模型精度，不进行真实未来预测。")
 
 
@@ -841,7 +961,7 @@ def render_comfort_page() -> None:
     result_columns[2].metric("舒适度等级", display_comfort_level)
 
     st.subheader("当前输入参数")
-    st.dataframe(
+    render_readonly_dataframe(
         pd.DataFrame(
             [
                 {
@@ -889,14 +1009,17 @@ def render_report_page() -> None:
         format_event_option(index, event)
         for index, (_, event) in enumerate(event_table.iterrows())
     ]
+    requested_event = st.session_state.pop("report_event_selection", None)
+    default_event_index = event_options.index(requested_event) if requested_event in event_options else 0
     selected_option = st.selectbox(
         "选择异常事件",
         event_options,
+        index=default_event_index,
         key=f"report_event_selection_{data_signature}",
     )
     selected_index = event_options.index(selected_option)
     selected_event = event_table.iloc[selected_index]
-    st.dataframe(
+    render_readonly_dataframe(
         pd.DataFrame([selected_event.to_dict()]),
         use_container_width=True,
         hide_index=True,
@@ -926,6 +1049,7 @@ def render_report_page() -> None:
         "风速 (m/s)", min_value=0.0, max_value=2.0, value=0.1, step=0.05, key="report_air_speed"
     )
 
+    st.warning("API 调用可能产生费用，用户输入的 API Key 仅用于本次请求。")
     if st.button("生成报告", type="primary", key="generate_report_button"):
         if not api_key.strip():
             st.warning("请输入 DeepSeek API Key 后再生成报告。")
@@ -1013,6 +1137,77 @@ def render_report_page() -> None:
         render_report_history(st.session_state["user_id"], data_signature)
     else:
         st.info("未登录状态不会保存历史报告；当前报告仍可查看和下载。需要历史报告时，请从左侧登录。")
+
+
+def render_overview_console() -> None:
+    """Compact overview with shared date range and actionable anomaly review."""
+    render_page_header("工业 AI 运维工作台", "运行态势、异常事件与下一步任务", "OPERATIONS WORKSPACE")
+    st.session_state["apply_time_filter"] = False
+    ensure_default_data()
+    full_data = st.session_state["current_data"]
+    signature = st.session_state["current_data_signature"]
+    st.markdown("### 全局时间筛选")
+    options = ["全部时间", "今日", "近 7 天", "近 30 天", "自定义时间范围"]
+    choice = st.selectbox("时间范围", options, key="time_filter")
+    start = pd.Timestamp(full_data.index.min()).normalize()
+    end = pd.Timestamp(full_data.index.max()).normalize()
+    if choice == "今日":
+        start = end
+    elif choice == "近 7 天":
+        start = max(start, end - pd.Timedelta(days=6))
+    elif choice == "近 30 天":
+        start = max(start, end - pd.Timedelta(days=29))
+    elif choice == "自定义时间范围":
+        picked = st.date_input("自定义日期", value=(start.date(), end.date()), min_value=start.date(), max_value=end.date(), key="custom_time_range")
+        if isinstance(picked, (tuple, list)) and len(picked) == 2:
+            start, end = pd.Timestamp(picked[0]), pd.Timestamp(picked[1])
+    end = end + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    active = full_data.loc[(full_data.index >= start) & (full_data.index <= end)]
+    st.session_state["time_filter_bounds"] = (start, end)
+    st.session_state["apply_time_filter"] = choice != "全部时间"
+    active_signature = f"{signature}:{choice}:{start.date()}:{end.date()}"
+    st.caption(f"当前时间范围：{start:%Y-%m-%d} 至 {end:%Y-%m-%d} · {len(active):,} 行")
+    if active.empty:
+        st.warning("当前时间范围内没有数据，请扩大范围。")
+    try:
+        anomaly_data, event_table = load_anomaly_data(active_signature, active)
+    except Exception as exc:
+        st.error(f"异常检测暂不可用：{exc}")
+        anomaly_data, event_table = active, pd.DataFrame()
+    anomaly_count = int((anomaly_data.get("iforest_prediction", pd.Series(dtype=int)) == -1).sum())
+    event_count = len(event_table)
+    status = "存在待关注事件" if event_count else ("分析就绪" if len(active) else "数据待处理")
+    dataset_name = st.session_state.get("current_data_name", st.session_state.get("current_data_source", "当前数据集"))
+    st.markdown(f"<div class='ops-overview-strip'><span class='ops-status-pill'>{status}</span><span>数据集：{dataset_name}</span><span>数据时间：{start:%Y-%m-%d} 至 {end:%Y-%m-%d}</span><span>数据行数：{len(active):,}</span></div>", unsafe_allow_html=True)
+    cards = st.columns(4)
+    cards[0].metric("数据行数", f"{len(active):,}")
+    cards[1].metric("分析正常记录", f"{max(len(active)-anomaly_count, 0):,}")
+    cards[2].metric("异常点数量", f"{anomaly_count:,}")
+    cards[3].metric("待关注事件", f"{event_count:,}")
+    left, right = st.columns([1.55, 1], gap="large")
+    with left:
+        st.markdown("### 运行趋势")
+        trend = active[["heat_load"]].dropna().tail(500) if "heat_load" in active else pd.DataFrame()
+        fig = go.Figure()
+        if not trend.empty:
+            fig.add_trace(go.Scatter(x=trend.index, y=trend["heat_load"], mode="lines", name="热负荷", line={"color": "#2563eb"}))
+        fig.update_layout(height=300, margin={"l": 10, "r": 10, "t": 10, "b": 10}, hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    with right:
+        st.markdown("### 异常预警")
+        if event_table.empty:
+            st.success("当前时间范围未生成异常事件。")
+        else:
+            risk_high = sum(1 for _, row in event_table.iterrows() if int(row.get("异常点数", 0)) >= 8)
+            risk_medium = max(event_count - risk_high, 0)
+            st.markdown(f"<div class='ops-alert-panel'><strong>{event_count} 个待关注事件</strong><span>异常点 {anomaly_count:,} · 模型风险分级：演示规则（高 {risk_high} / 中 {risk_medium} / 低 0）</span><small>当前数据未提供设备标识</small></div>", unsafe_allow_html=True)
+            render_readonly_dataframe(event_table.head(4), use_container_width=True, hide_index=True)
+            if st.button("进入异常诊断", type="primary", key="overview_to_anomaly"):
+                st.session_state["pending_page"] = "异常诊断"
+                st.rerun()
+    st.markdown("### 核心运行结论")
+    conclusion = "当前时间范围内未发现统计异常事件，可继续进行分析。" if not event_count else f"检测到 {event_count} 个统计异常事件，建议进入异常诊断页面进行人工复核。"
+    st.markdown(f"<div class='ops-ai-summary'><strong>{conclusion}</strong><small>异常标记不等于已确认设备故障。</small></div>", unsafe_allow_html=True)
 
 
 st.set_page_config(page_title="工业 AI 运维平台", layout="wide")
@@ -1173,6 +1368,16 @@ def inject_app_styles() -> None:
         .ops-ai-summary p { margin: 0.25rem 0; color: #164e63; }
         .ops-ai-summary small { color: #64748b; }
 
+        .ops-overview-strip {
+            display: flex; flex-wrap: wrap; gap: 0.55rem 1.1rem; align-items: center;
+            padding: 0.75rem 0.9rem; margin: 0.3rem 0 1rem;
+            border: 1px solid var(--ops-border); border-radius: 8px; background: #fff; color: var(--ops-muted); font-size: 0.86rem;
+        }
+        .ops-status-pill { padding: 0.25rem 0.55rem; border-radius: 999px; background: #dcfce7; color: #166534; font-weight: 700; }
+        .ops-alert-panel { display: grid; gap: 0.25rem; padding: 0.8rem 0.9rem; border: 1px solid #fbbf24; border-left: 4px solid #d97706; border-radius: 8px; background: #fffbeb; margin-bottom: 0.6rem; }
+        .ops-alert-panel strong { color: #92400e; font-size: 1.1rem; }
+        .ops-alert-panel span, .ops-alert-panel small { color: #78350f; }
+
         .ops-system-status {
             display: flex;
             gap: 0.65rem;
@@ -1245,6 +1450,7 @@ def inject_app_styles() -> None:
             font-size: 1.65rem;
             font-weight: 700;
         }
+        [data-testid="stMetric"]:nth-child(3), [data-testid="stMetric"]:nth-child(4) { border-top: 3px solid #f59e0b; }
 
         [data-testid="stMetricDelta"] { font-size: 0.72rem; }
 
@@ -1285,6 +1491,12 @@ def inject_app_styles() -> None:
 
         [data-testid="stDataFrame"] iframe {
             border-radius: 7px;
+        }
+
+        /* Streamlit's grid opens a fixed cell-editor overlay on double-click.
+           Tables in this console are read-only; hide that overlay while keeping row selection active. */
+        [data-testid="stDataFrame"] input {
+            display: none !important;
         }
 
         [data-testid="stAlert"] {
@@ -1404,6 +1616,43 @@ def render_login() -> None:
 
 if st.session_state.get("show_login"):
     render_login()
+    st.stop()
+
+if not st.session_state.get("show_login"):
+    # New task-oriented navigation; the legacy block below remains as a compatibility fallback.
+    with st.sidebar:
+        st.markdown("<div class='ops-brand'><div class='ops-brand-mark'>AI</div><p class='ops-brand-title'>工业 AI 运维平台</p><p class='ops-brand-subtitle'>Operations Workspace · v1.0</p></div>", unsafe_allow_html=True)
+        if st.session_state.get("authenticated"):
+            st.caption(f"当前用户：{st.session_state.get('display_name', st.session_state['user_id'])}")
+            if st.button("退出登录", key="new_logout"):
+                for key in ("authenticated", "user_id", "display_name"):
+                    st.session_state.pop(key, None)
+                st.rerun()
+        else:
+            st.caption("当前为访客模式")
+            if st.button("登录", key="new_login"):
+                st.session_state["show_login"] = True
+                st.rerun()
+        st.markdown("<div class='ops-nav-label'>WORKSPACE</div>", unsafe_allow_html=True)
+        page_options = ["总览", "数据准备", "预测分析", "异常诊断", "热舒适度", "报告输出"]
+        pending_page = st.session_state.pop("pending_page", None)
+        if pending_page in page_options:
+            st.session_state["page"] = pending_page
+            st.session_state["new_page"] = pending_page
+        page = st.radio("页面", page_options, index=page_options.index(st.session_state.get("page", "总览")), key="new_page")
+        st.session_state["page"] = page
+    if page == "总览":
+        render_overview_console()
+    elif page == "数据准备":
+        render_upload_page()
+    elif page == "预测分析":
+        render_prediction_page()
+    elif page == "异常诊断":
+        render_anomaly_page()
+    elif page == "热舒适度":
+        render_comfort_page()
+    else:
+        render_report_page()
     st.stop()
 
 with st.sidebar:

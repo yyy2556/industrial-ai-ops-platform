@@ -1,6 +1,6 @@
 # 工业 AI 运维平台
 
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
+[![Version](https://img.shields.io/badge/version-v1.0.1-blue)](https://github.com/yyy2556/industrial-ai-ops-platform)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 项目简介
@@ -157,6 +157,7 @@ DeepSeek API 调用可能产生费用并受账户额度、请求频率和模型�
 | v0.4.0 | CSV 上传校验、业务页面接入、SQLite 历史报告存储与查询 |
 | v0.4.1 | 演示登录系统（按用户隔离报告）、缓存与上传限制（20MB/200k 行）、Markdown 报告下载、访客模式 |
 | v1.0.0 | 工业运维控制台视觉升级、统一页面样式、响应式布局、访客直接使用和按需登录 |
+| v1.0.1 | 优化工作台导航与总览、增加时间范围筛选、强化异常事件联动和报告合规提示、改进页面交互稳定性 |
 
 ## 当前限制
 
