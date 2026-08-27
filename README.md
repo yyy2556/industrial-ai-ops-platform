@@ -7,9 +7,12 @@
 
 面向换热站场景的工业 AI 运维与能效分析平台，提供热负荷预测、异常检测、PMV/PPD 热舒适度评估、SHAP 分析和 DeepSeek 智能报告。当前为公开演示版，主要用于历史回测和辅助分析。
 
-在线演示：[industrial-ai-ops-platform.streamlit.app](https://industrial-ai-ops-platform.streamlit.app/)
+在线演示：
 
-访问提示：国内用户访问该演示地址可能需要代理。
+- [Streamlit Community Cloud](https://industrial-ai-ops-platform.streamlit.app/)
+- [魔搭社区 ModelScope](https://modelscope.cn/studios/yyy2556/industrial-ai-ops-platform)
+
+访问提示：Streamlit Community Cloud 初次加载可能较慢，请耐心等待。
 
 ## 系统架构
 
