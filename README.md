@@ -49,9 +49,15 @@
 
 ### 3. 启动 Streamlit 页面
 
-在项目根目录运行：
+在项目根目录运行主入口：
+
+    python -m streamlit run app.py
+
+兼容原有 Streamlit / Dev Container 配置，也可以运行：
 
     python -m streamlit run frontend/app.py
+
+app.py 是魔搭社区的根目录入口，frontend/app.py 只是兼容启动器；两者共用同一套业务代码和数据路径。
 
 启动后，在浏览器打开：http://localhost:8501
 
@@ -71,8 +77,9 @@
     │   └── config.py              # YAML 设备配置加载
     ├── config/
     │   └── device_profiles.yaml   # 换热站预测与异常检测配置
+    ├── app.py                    # 魔搭社区根目录入口和 Streamlit 主应用
     ├── frontend/
-    │   └── app.py                 # 五页 Streamlit 应用和上传入口
+    │   └── app.py                 # 兼容旧启动命令的转发入口
     ├── .streamlit/
     │   └── config.toml            # Streamlit 上传大小配置
     ├── data/

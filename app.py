@@ -1,0 +1,1452 @@
+
+"""Streamlit page for heat-load backtesting and model interpretation."""
+
+from pathlib import Path
+import hashlib
+import io
+import os
+import sys
+from datetime import datetime
+from datetime import timedelta
+
+import matplotlib.pyplot as plt
+import matplotlib
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import shap
+import streamlit as st
+import re
+
+
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR if (APP_DIR / "backend").is_dir() else APP_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.data_pipeline import clean_data, load_data, split_train_test
+from backend.digital_twin import calc_residual, calc_theoretical_load
+from backend.feature_engineer import build_features
+from backend.forecast import evaluate_model, predict_model, train_model
+from backend.anomaly import detect_anomalies, merge_alerts, root_cause_analysis
+from backend.comfort import calculate_pmv
+from backend.agents import generate_full_report
+from backend.auth import authenticate_user
+from backend.report_store import delete_report, list_reports, save_report
+
+
+FEATURE_COLUMNS = [
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "heat_load_lag1",
+    "heat_load_lag24",
+    "heat_load_rolling_mean_24h",
+    "supply_temp_rolling_mean_24h",
+    "delta_T",
+    "outdoor_temp",
+    "supply_temp",
+    "return_temp",
+]
+
+REQUIRED_COLUMNS = [
+    "timestamp",
+    "outdoor_temp",
+    "supply_temp",
+    "return_temp",
+    "heat_load",
+]
+OPTIONAL_COLUMNS = [
+    "flow_rate",
+    "power_consumption",
+    "indoor_temp",
+    "humidity",
+]
+NUMERIC_COLUMNS = REQUIRED_COLUMNS[1:] + OPTIONAL_COLUMNS
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "unified_data.csv"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_ROWS = 200_000
+CACHE_TTL = timedelta(days=3)
+CACHE_MAX_ENTRIES = 5
+
+
+def prepare_current_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Validate a CSV and return its cleaned, feature-engineered data."""
+    if not isinstance(raw_data, pd.DataFrame):
+        raise ValueError("上传内容不是有效的 CSV 数据。")
+    if raw_data.empty:
+        raise ValueError("CSV 数据为空，无法继续分析。")
+    if len(raw_data) < 2:
+        raise ValueError("CSV 数据行数不足，至少需要 2 行数据。")
+    if len(raw_data) > MAX_UPLOAD_ROWS:
+        raise ValueError(f"CSV 行数超过限制，最多支持 {MAX_UPLOAD_ROWS:,} 行。")
+
+    missing_required = [column for column in REQUIRED_COLUMNS if column not in raw_data.columns]
+    if missing_required:
+        raise ValueError(f"缺少必需字段: {', '.join(missing_required)}")
+
+    data = raw_data.copy()
+    parsed_timestamp = pd.to_datetime(data["timestamp"], errors="coerce")
+    invalid_timestamp_count = int(parsed_timestamp.isna().sum())
+    if invalid_timestamp_count:
+        raise ValueError(f"timestamp 有 {invalid_timestamp_count} 个值无法转换为 datetime。")
+    data["timestamp"] = parsed_timestamp
+
+    for column in NUMERIC_COLUMNS:
+        if column not in data.columns:
+            continue
+        original = data[column]
+        converted = pd.to_numeric(original, errors="coerce")
+        non_empty = original.notna() & original.astype("string").str.strip().ne("")
+        invalid_count = int((non_empty & converted.isna()).sum())
+        if invalid_count:
+            raise ValueError(f"数值字段 {column} 有 {invalid_count} 个值无法转换为数值。")
+        data[column] = converted
+
+    empty_required = [
+        column for column in REQUIRED_COLUMNS[1:] if data[column].notna().sum() == 0
+    ]
+    if empty_required:
+        raise ValueError(f"必需数值字段完全为空: {', '.join(empty_required)}")
+
+    duplicate_count = int(data["timestamp"].duplicated(keep=False).sum())
+    warnings: list[str] = []
+    if duplicate_count:
+        warnings.append(f"检测到 {duplicate_count} 行重复时间戳，已保留重复行并继续处理。")
+
+    missing_optional = [column for column in OPTIONAL_COLUMNS if column not in data.columns]
+    if missing_optional:
+        warnings.append(f"缺少可选字段: {', '.join(missing_optional)}，相关功能将不可用。")
+        for column in missing_optional:
+            data[column] = np.nan
+
+    data = data.set_index("timestamp")
+    processed = build_features(clean_data(data))
+    return processed, warnings
+
+
+def set_current_data(
+    data: pd.DataFrame,
+    source: str,
+    signature: str,
+    dataset_name: str | None = None,
+) -> None:
+    """Store the current processed data in the active Streamlit session."""
+    st.session_state["current_data"] = data
+    st.session_state["current_data_source"] = source
+    st.session_state["current_data_signature"] = signature
+    st.session_state["current_data_name"] = dataset_name or source
+    st.session_state.pop("full_report_result", None)
+    st.session_state.pop("full_report_event", None)
+
+
+def ensure_default_data() -> None:
+    """Load the demo CSV once when the session has no current data."""
+    if "current_data" in st.session_state:
+        return
+    if not DEFAULT_DATA_PATH.is_file():
+        raise FileNotFoundError(f"默认演示数据不存在: {DEFAULT_DATA_PATH}")
+    raw_data = pd.read_csv(DEFAULT_DATA_PATH)
+    processed, warnings = prepare_current_data(raw_data)
+    stat = DEFAULT_DATA_PATH.stat()
+    signature = f"default:{stat.st_mtime_ns}:{stat.st_size}"
+    set_current_data(processed, "默认演示数据", signature, DEFAULT_DATA_PATH.name)
+    st.session_state["current_data_warnings"] = warnings
+
+
+def get_current_data() -> tuple[pd.DataFrame, str]:
+    """Return current session data and its cache signature."""
+    ensure_default_data()
+    return st.session_state["current_data"], st.session_state["current_data_signature"]
+
+
+@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
+def load_feature_data(data_signature: str, _data: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of the session data keyed by its current signature."""
+    return _data.copy()
+
+
+@st.cache_resource(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
+def load_and_train(data_signature: str, _data: pd.DataFrame):
+    """Load data and train once per Streamlit cache key."""
+    data = load_feature_data(data_signature, _data)
+    if len(data) < 25:
+        raise ValueError("当前数据行数不足，无法可靠构造 lag24 特征或完成时间切分，至少需要 25 行。")
+    train_data, test_data = split_train_test(data)
+
+    X_train = train_data[FEATURE_COLUMNS]
+    y_train = train_data["heat_load"]
+    X_test = test_data[FEATURE_COLUMNS]
+    y_test = test_data["heat_load"]
+    if X_train.isna().any().any() or X_test.isna().any().any():
+        raise ValueError("特征数据包含 NaN，无法进行回测。")
+    if y_train.isna().any() or y_test.isna().any():
+        raise ValueError("目标数据包含 NaN，无法进行回测。")
+
+    model = train_model(X_train, y_train)
+    y_pred = predict_model(model, X_test)
+    return model, X_test, y_test, y_pred, evaluate_model(y_test, y_pred), len(data), len(train_data)
+
+
+@st.cache_resource(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
+def make_shap_explanation(_model, X_test: pd.DataFrame):
+    """Explain at most 1,000 test rows to keep page rendering responsive."""
+    X_sample = X_test.iloc[:1000]
+    explainer = shap.TreeExplainer(_model)
+    shap_values = explainer.shap_values(X_sample)
+    return explainer, X_sample, shap_values
+
+
+def build_backtest_figure(y_test: pd.Series, y_pred: np.ndarray) -> go.Figure:
+    count = min(500, len(y_test))
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=y_test.index[:count], y=y_test.iloc[:count], mode="lines", name="真实值", line={"color": "#2563eb"}))
+    figure.add_trace(go.Scatter(x=y_test.index[:count], y=y_pred[:count], mode="lines", name="预测值", line={"color": "#dc2626"}))
+    figure.update_layout(xaxis_title="时间", yaxis_title="热负荷", hovermode="x unified")
+    return figure
+
+
+def build_digital_twin_figure(test_data: pd.DataFrame, y_test: pd.Series) -> go.Figure:
+    count = min(500, len(test_data))
+    timestamps = y_test.index[:count]
+    theoretical = calc_theoretical_load(
+        test_data["supply_temp"].iloc[:count],
+        test_data["return_temp"].iloc[:count],
+        test_data["flow_rate"].iloc[:count] if "flow_rate" in test_data else None,
+    )
+    residual = calc_residual(test_data.iloc[:count])
+
+    figure = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12, subplot_titles=("实测值 vs 理论值", "残差"))
+    figure.add_trace(go.Scatter(x=timestamps, y=y_test.iloc[:count], mode="lines", name="实测值", line={"color": "#2563eb"}), row=1, col=1)
+    figure.add_trace(go.Scatter(x=timestamps, y=theoretical, mode="lines", name="理论值", line={"color": "#f59e0b", "dash": "dash"}), row=1, col=1)
+    figure.add_trace(go.Scatter(x=timestamps, y=residual, mode="lines", name="残差", line={"color": "#7c3aed"}, fill="tozeroy", fillcolor="rgba(124, 58, 237, 0.16)"), row=2, col=1)
+    figure.add_hline(y=0, line_dash="dot", line_color="#64748b", row=2, col=1)
+    figure.update_yaxes(title_text="热负荷", row=1, col=1)
+    figure.update_yaxes(title_text="实测 - 理论", row=2, col=1)
+    figure.update_layout(height=650, hovermode="x unified", legend={"orientation": "h", "y": 1.08})
+    return figure
+
+
+CAUSE_PRIORITY = [
+    "疑似温度传感器异常",
+    "疑似换热效率异常",
+    "疑似热负荷突变",
+    "需要人工复核",
+]
+
+
+def summarize_event_causes(data: pd.DataFrame, events: list[dict]) -> pd.DataFrame:
+    """Add the most common suspected cause to each anomaly event."""
+    rows = []
+    for event in events:
+        start_time = pd.Timestamp(event["start_time"])
+        end_time = pd.Timestamp(event["end_time"])
+        event_rows = data.loc[
+            (data.index >= start_time)
+            & (data.index <= end_time)
+            & (data["iforest_prediction"] == -1)
+        ]
+        causes = event_rows["suspected_cause"].replace("", pd.NA).dropna()
+        counts = causes.value_counts()
+        if counts.empty:
+            suspected_cause = "需要人工复核"
+        else:
+            max_count = counts.max()
+            suspected_cause = next(
+                (cause for cause in CAUSE_PRIORITY if counts.get(cause, 0) == max_count),
+                "需要人工复核",
+            )
+        rows.append(
+            {
+                "起始时间": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "结束时间": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "持续时长": f"{event['duration_hours']:.2f} 小时",
+                "异常点数": int(event["anomaly_count"]),
+                "疑似原因": suspected_cause,
+            }
+        )
+    return pd.DataFrame(rows, columns=["起始时间", "结束时间", "持续时长", "异常点数", "疑似原因"])
+
+
+def format_event_option(event_index: int, event: pd.Series) -> str:
+    """Format one anomaly event as a readable PMV selection option."""
+    return (
+        f"事件 {event_index + 1}: {event['起始时间']} 至 {event['结束时间']} | "
+        f"原因: {event['疑似原因']} | 异常点数: {event['异常点数']}"
+    )
+
+
+def get_event_outdoor_temp(
+    data: pd.DataFrame,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+) -> float:
+    """Return the event-period outdoor temperature or the demo fallback."""
+    fallback = 10.0
+    if "outdoor_temp" not in data.columns:
+        return fallback
+    event_values = data.loc[
+        (data.index >= start_time) & (data.index <= end_time), "outdoor_temp"
+    ].dropna()
+    if event_values.empty:
+        return fallback
+    outdoor_temp = float(event_values.mean())
+    return outdoor_temp if np.isfinite(outdoor_temp) else fallback
+
+
+def build_report_event_data(
+    data: pd.DataFrame,
+    event: pd.Series,
+) -> dict:
+    """Build a compact anomaly summary and scalar measurements for the agents."""
+    start_time = pd.to_datetime(event["起始时间"])
+    end_time = pd.to_datetime(event["结束时间"])
+    event_rows = data.loc[(data.index >= start_time) & (data.index <= end_time)]
+    measurement_columns = [
+        "supply_temp",
+        "return_temp",
+        "outdoor_temp",
+        "heat_load",
+        "delta_T",
+    ]
+    measurements = {}
+    for column in measurement_columns:
+        if column in event_rows.columns:
+            values = event_rows[column].dropna()
+            if not values.empty:
+                measurements[column] = float(values.mean())
+    return {
+        "start_time": event["起始时间"],
+        "end_time": event["结束时间"],
+        "duration_hours": float(str(event["持续时长"]).split()[0]),
+        "anomaly_count": int(event["异常点数"]),
+        "suspected_cause": event["疑似原因"] or "需要人工复核",
+        "measurements": measurements,
+    }
+
+
+def friendly_report_error(exc: Exception) -> str:
+    """Map common LLM failures to safe messages for the page."""
+    message = str(exc)
+    if "401" in message or "Key 无效" in message or "Key" in message and "无效" in message:
+        return "API Key 无效或已过期。"
+    if "超时" in message or "timeout" in message.lower():
+        return "请求超时，请稍后重试。"
+    if "429" in message or "额度" in message or "频率" in message:
+        return "API 当前不可用，请检查额度或稍后重试。"
+    return "报告生成失败，请检查 API 配置或稍后重试。"
+
+
+def report_markdown(report_data: dict, dataset_name: str, event_label: str) -> str:
+    """Build a portable Markdown report for local download."""
+    report = report_data.get("report", "未提供")
+    return (
+        f"# 工业 AI 运维报告\n\n"
+        f"- 生成日期：{datetime.now().strftime('%Y-%m-%d')}\n"
+        f"- 数据集：{dataset_name}\n"
+        f"- 异常事件：{event_label}\n\n"
+        "## 诊断摘要\n\n"
+        f"{report_data.get('diagnosis', '未提供')}\n\n"
+        "## 运行建议\n\n"
+        f"{report_data.get('suggestion', '未提供')}\n\n"
+        "## 完整运维报告\n\n"
+        f"{report}\n"
+    )
+
+
+def render_report_history(user_id: str, data_signature: str) -> None:
+    """Render current-dataset report history with view and delete actions."""
+    st.subheader("历史报告")
+    try:
+        reports = list_reports(user_id=user_id, dataset_signature=data_signature)
+    except Exception as exc:
+        st.error(f"历史报告读取失败：{exc}")
+        return
+
+    if not reports:
+        st.info("暂无历史报告")
+        return
+
+    history_table = pd.DataFrame(
+        [
+            {
+                "生成时间": item["created_at"],
+                "数据集名称": item["dataset_name"],
+                "异常事件时间": f"{item['event_start_time']} 至 {item['event_end_time']}",
+                "异常原因": item["suspected_cause"],
+            }
+            for item in reports
+        ]
+    )
+    st.dataframe(history_table, use_container_width=True, hide_index=True)
+
+    option_labels = [
+        f"{item['created_at']} | {item['event_start_time']} | "
+        f"{item['suspected_cause']} | 报告 ID {item['id']}"
+        for item in reports
+    ]
+    selected_index = st.selectbox(
+        "选择历史报告",
+        range(len(reports)),
+        format_func=lambda index: option_labels[index],
+        key=f"history_report_selection_{data_signature}",
+    )
+    selected_report = reports[selected_index]
+    st.markdown("**诊断结果**")
+    st.write(selected_report["diagnosis"])
+    st.markdown("**运行建议**")
+    st.write(selected_report["suggestion"])
+    st.markdown("**完整运维报告**")
+    st.write(selected_report["report"])
+    st.download_button(
+        "下载 Markdown 报告",
+        data=report_markdown(
+            selected_report,
+            selected_report["dataset_name"],
+            f"{selected_report['event_start_time']} 至 {selected_report['event_end_time']}",
+        ),
+        file_name=f"industrial_ops_report_{datetime.now().strftime('%Y-%m-%d')}.md",
+        mime="text/markdown",
+        key=f"download_history_report_{selected_report['id']}",
+    )
+    if st.button("删除选中的历史报告", key="delete_history_report"):
+        try:
+            if delete_report(int(selected_report["id"]), user_id=user_id):
+                st.session_state["history_report_notice"] = "历史报告已删除。"
+                st.rerun()
+            st.warning("未找到要删除的历史报告。")
+        except Exception as exc:
+            st.error(f"历史报告删除失败：{exc}")
+
+
+@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES)
+def load_anomaly_data(data_signature: str, _data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load, detect, label, and group anomalies using Streamlit data cache."""
+    data = load_feature_data(data_signature, _data).copy()
+    if not isinstance(data.index, pd.DatetimeIndex):
+        converted_index = pd.to_datetime(data.index, errors="coerce")
+        if converted_index.isna().any():
+            raise ValueError("异常检测数据的时间索引无法转换为 datetime。")
+        data.index = converted_index
+
+    data = detect_anomalies(data)
+    data = root_cause_analysis(data)
+    events = merge_alerts(data)
+    event_table = summarize_event_causes(data, events)
+    return data, event_table
+
+
+def render_page_header(title: str, description: str, eyebrow: str = "OPERATIONS CONSOLE") -> None:
+    """Render a consistent product-style header for each workspace."""
+    st.markdown(
+        f"""<div class="ops-page-header">
+            <div class="ops-eyebrow">{eyebrow}</div>
+            <h1>{title}</h1>
+            <p>{description}</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_overview_page() -> None:
+    """Render the first-screen operations cockpit."""
+    render_page_header(
+        "工业智能运维驾驶舱",
+        "面向换热站的运行态势、异常事件与模型服务总览",
+        "INDUSTRIAL AI OPERATIONS",
+    )
+    data, data_signature = get_current_data()
+    try:
+        anomaly_data, event_table = load_anomaly_data(data_signature, data)
+        anomaly_count = int((anomaly_data["iforest_prediction"] == -1).sum())
+        event_count = len(event_table)
+    except Exception:
+        anomaly_count, event_count = 0, 0
+        event_table = pd.DataFrame()
+
+    total_count = len(data)
+    healthy_count = max(total_count - anomaly_count, 0)
+    anomaly_ratio = anomaly_count / total_count * 100 if total_count else 0
+    kpis = st.columns(4)
+    kpis[0].metric("监测记录", f"{total_count:,}", "当前数据集")
+    kpis[1].metric("正常记录", f"{healthy_count:,}", f"{100 - anomaly_ratio:.1f}%")
+    kpis[2].metric("异常点", f"{anomaly_count:,}", f"{anomaly_ratio:.2f}%")
+    kpis[3].metric("待关注事件", f"{event_count:,}", "Isolation Forest")
+
+    left, right = st.columns([1.65, 1], gap="large")
+    with left:
+        st.markdown("### 设备运行趋势")
+        trend = data[["heat_load"]].copy()
+        trend["heat_load"] = pd.to_numeric(trend["heat_load"], errors="coerce")
+        trend = trend.dropna().tail(500)
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=trend.index, y=trend["heat_load"], mode="lines", name="热负荷", line={"color": "#0ea5e9", "width": 2}))
+        figure.update_layout(height=330, margin={"l": 10, "r": 10, "t": 15, "b": 10}, hovermode="x unified", xaxis_title="", yaxis_title="热负荷")
+        st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
+    with right:
+        st.markdown("### 异常预警")
+        if event_table.empty:
+            st.success("当前数据未生成异常事件")
+        else:
+            st.warning(f"检测到 {event_count} 个待关注事件")
+            st.dataframe(event_table.head(4)[["起始时间", "持续时长", "异常点数", "疑似原因"]], use_container_width=True, hide_index=True)
+
+    st.markdown("### AI 运维分析")
+    status_text = "当前系统整体运行稳定，可继续关注异常事件变化。" if anomaly_count == 0 else f"当前检测到 {event_count} 个异常事件，建议优先核查高频异常时段及相关设备测点。"
+    st.markdown(f'''<div class="ops-ai-summary"><span class="ops-ai-dot"></span><div><strong>AI 状态摘要</strong><p>{status_text}</p><small>分析基于当前数据集与无监督异常检测结果，仅供运维人员研判。</small></div></div>''', unsafe_allow_html=True)
+
+
+def render_upload_page() -> None:
+    """Render CSV upload, schema validation, and data preview."""
+    render_page_header("数据中心", "上传、校验并预览换热站运行数据", "DATA CENTER / INGEST")
+    st.caption("上传有效 CSV 后，本次会话中的业务页面将使用该数据；文件不会写入项目目录。")
+    uploaded_file = st.file_uploader("上传 CSV 文件", type=["csv"])
+
+    ensure_default_data()
+    if uploaded_file is None:
+        if st.session_state.get("current_data_source") != "默认演示数据":
+            raw_data = pd.read_csv(DEFAULT_DATA_PATH)
+            processed, warnings = prepare_current_data(raw_data)
+            stat = DEFAULT_DATA_PATH.stat()
+            signature = f"default:{stat.st_mtime_ns}:{stat.st_size}"
+            set_current_data(processed, "默认演示数据", signature, DEFAULT_DATA_PATH.name)
+            st.session_state["current_data_warnings"] = warnings
+    else:
+        file_bytes = uploaded_file.getvalue()
+        signature = f"upload:{hashlib.sha256(file_bytes).hexdigest()}"
+        if st.session_state.get("current_data_signature") != signature:
+            try:
+                if len(file_bytes) > MAX_UPLOAD_BYTES:
+                    raise ValueError("CSV 文件超过限制，最大支持 20MB。")
+                raw_data = pd.read_csv(io.BytesIO(file_bytes))
+                processed, warnings = prepare_current_data(raw_data)
+                set_current_data(processed, "用户上传数据", signature, uploaded_file.name)
+                st.session_state["current_data_warnings"] = warnings
+                st.success("CSV 校验和数据处理成功，已切换到用户上传数据。")
+            except Exception as exc:
+                st.error(f"CSV 校验失败：{exc}")
+
+    data, _ = get_current_data()
+    source = st.session_state.get("current_data_source", "默认演示数据")
+    st.info(f"当前使用{source}")
+    for warning in st.session_state.get("current_data_warnings", []):
+        st.warning(warning)
+
+    st.subheader("数据概览")
+    overview = st.columns(2)
+    overview[0].metric("数据行数", f"{len(data):,}")
+    overview[1].metric("字段数量", f"{len(data.columns):,}")
+    st.write("当前列名：", ", ".join(map(str, data.columns)))
+    st.subheader("前 10 行预览")
+    st.dataframe(data.head(10), use_container_width=True)
+
+
+def build_anomaly_timeseries(data: pd.DataFrame) -> go.Figure:
+    """Build a heat-load line with red anomaly markers overlaid."""
+    anomaly_mask = data["iforest_prediction"] == -1
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["heat_load"],
+            mode="lines",
+            name="热负荷",
+            line={"color": "#2563eb", "width": 1.5},
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=data.index[anomaly_mask],
+            y=data.loc[anomaly_mask, "heat_load"],
+            mode="markers",
+            name="模型标记异常",
+            marker={"color": "#dc2626", "size": 7},
+        )
+    )
+    figure.update_layout(
+        xaxis_title="时间",
+        yaxis_title="热负荷",
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+    )
+    return figure
+
+
+def build_anomaly_hourly_figure(data: pd.DataFrame) -> go.Figure:
+    """Build a complete 0-23 hour anomaly-count chart."""
+    anomaly_times = data.index[data["iforest_prediction"] == -1]
+    counts = pd.Series(anomaly_times.hour).value_counts().reindex(range(24), fill_value=0)
+    figure = go.Figure(
+        go.Bar(x=list(range(24)), y=counts.tolist(), name="异常次数", marker_color="#7c3aed")
+    )
+    figure.update_layout(xaxis_title="小时", yaxis_title="异常次数", xaxis={"dtick": 1})
+    return figure
+
+
+def render_anomaly_page() -> None:
+    """Render the anomaly detection and alert review page."""
+    render_page_header("异常检测", "识别潜在异常状态，并将离散异常点合并为可处理事件", "INTELLIGENCE / ANOMALY")
+    st.caption(
+        "本页面基于 Isolation Forest 无监督异常检测，标记结果需结合业务规则判断，"
+        "不直接作为设备故障判决依据。"
+    )
+    try:
+        current_data, data_signature = get_current_data()
+        data, event_table = load_anomaly_data(data_signature, current_data)
+    except Exception as exc:
+        st.error(f"异常检测页面加载失败：{exc}")
+        return
+
+    anomaly_mask = data["iforest_prediction"] == -1
+    total_count = len(data)
+    anomaly_count = int(anomaly_mask.sum())
+    event_count = len(event_table)
+    anomaly_ratio = anomaly_count / total_count * 100 if total_count else 0.0
+
+    overview = st.columns(4)
+    overview[0].metric("总行数", f"{total_count:,}")
+    overview[1].metric("异常点数", f"{anomaly_count:,}")
+    overview[2].metric("异常事件数", f"{event_count:,}")
+    overview[3].metric("异常比例", f"{anomaly_ratio:.2f}%")
+
+    st.subheader("热负荷异常点")
+    st.plotly_chart(build_anomaly_timeseries(data), use_container_width=True)
+
+    st.subheader("异常事件")
+    cause_options = ["全部", *CAUSE_PRIORITY]
+    selected_cause = st.selectbox("疑似原因筛选", cause_options)
+    if selected_cause == "全部":
+        filtered_events = event_table
+    else:
+        filtered_events = event_table[event_table["疑似原因"] == selected_cause]
+    if filtered_events.empty:
+        st.info("暂无异常事件")
+    else:
+        st.dataframe(filtered_events, use_container_width=True, hide_index=True)
+
+    st.subheader("异常时段热舒适风险")
+    st.info(
+        "当前数据缺少室内温度和室内湿度，因此以下 PMV 结果使用手动输入参数，"
+        "仅用于演示异常时段的热舒适度评估。"
+    )
+    if event_table.empty:
+        st.info("暂无异常事件，暂时跳过 PMV 联动。")
+    else:
+        event_options = [
+            format_event_option(index, event)
+            for index, (_, event) in enumerate(event_table.iterrows())
+        ]
+        selected_event_option = st.selectbox(
+            "选择异常事件",
+            event_options,
+            key=f"anomaly_comfort_event_{data_signature}",
+        )
+        selected_event_index = event_options.index(selected_event_option)
+        selected_event = event_table.iloc[selected_event_index]
+        selected_start = pd.to_datetime(selected_event["起始时间"])
+        selected_end = pd.to_datetime(selected_event["结束时间"])
+        event_outdoor_temp = get_event_outdoor_temp(data, selected_start, selected_end)
+
+        comfort_inputs = st.columns(4)
+        comfort_indoor_temp = comfort_inputs[0].number_input(
+            "异常时段室内温度 (°C)",
+            min_value=10.0,
+            max_value=35.0,
+            value=24.0,
+            step=0.5,
+            key="anomaly_comfort_indoor_temp",
+        )
+        comfort_indoor_humidity = comfort_inputs[1].number_input(
+            "异常时段室内湿度 (%)",
+            min_value=20.0,
+            max_value=90.0,
+            value=50.0,
+            step=1.0,
+            key="anomaly_comfort_indoor_humidity",
+        )
+        comfort_outdoor_temp = comfort_inputs[2].number_input(
+            "异常时段室外温度 (°C)",
+            min_value=-20.0,
+            max_value=40.0,
+            value=float(np.clip(event_outdoor_temp, -20.0, 40.0)),
+            step=0.5,
+            key=f"anomaly_comfort_outdoor_temp_{selected_event_index}",
+        )
+        comfort_air_speed = comfort_inputs[3].number_input(
+            "异常时段风速 (m/s)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.1,
+            step=0.05,
+            key="anomaly_comfort_air_speed",
+        )
+
+        try:
+            comfort_result = calculate_pmv(
+                indoor_temp=comfort_indoor_temp,
+                indoor_humidity=comfort_indoor_humidity,
+                outdoor_temp=comfort_outdoor_temp,
+                air_speed=comfort_air_speed,
+            )
+            display_comfort_level = re.sub(
+                r"^[+-]?\d+\s*", "", comfort_result["舒适度等级"]
+            )
+            comfort_results = st.columns(3)
+            comfort_results[0].metric("PMV", f"{comfort_result['PMV']:.3f}")
+            comfort_results[1].metric("PPD", f"{comfort_result['PPD']:.2f}%")
+            comfort_results[2].metric("舒适度等级", display_comfort_level)
+            st.write(
+                f"当前选择事件：{selected_event['起始时间']} 至 {selected_event['结束时间']}"
+            )
+            st.write(
+                f"当前输入参数：室内温度 {comfort_indoor_temp:.1f}°C，"
+                f"室内湿度 {comfort_indoor_humidity:.1f}%，"
+                f"室外温度 {comfort_outdoor_temp:.1f}°C，"
+                f"风速 {comfort_air_speed:.2f} m/s"
+            )
+            st.caption(
+                "上述 PMV/PPD 是基于手动室内参数的演示估计，不代表该异常时段的真实室内热舒适状态。"
+            )
+        except Exception as exc:
+            st.error(f"异常时段 PMV 热舒适度计算失败：{exc}")
+
+    st.subheader("异常小时分布")
+    st.plotly_chart(build_anomaly_hourly_figure(data), use_container_width=True)
+
+
+def render_prediction_page() -> None:
+    """Render the existing heat-load prediction backtest page."""
+    render_page_header("负荷预测", "通过历史回测评估热负荷模型表现与特征贡献", "INTELLIGENCE / FORECAST")
+    try:
+        current_data, data_signature = get_current_data()
+        model, X_test, y_test, y_pred, metrics, total_count, train_count = load_and_train(
+            data_signature, current_data
+        )
+    except Exception as exc:
+        st.error(f"页面加载失败：{exc}")
+        return
+
+    st.subheader("数据概览")
+    overview = st.columns(3)
+    overview[0].metric("总数据量", f"{total_count:,}")
+    overview[1].metric("训练集样本", f"{train_count:,}")
+    overview[2].metric("测试集样本", f"{len(X_test):,}")
+
+    st.subheader("回测指标")
+    cards = st.columns(3)
+    cards[0].metric("MAE", f"{metrics['mae']:.4f}")
+    cards[1].metric("RMSE", f"{metrics['rmse']:.4f}")
+    cards[2].metric("R²", f"{metrics['r2']:.4f}")
+
+    st.subheader("测试集前 500 个点")
+    st.plotly_chart(build_backtest_figure(y_test, y_pred), use_container_width=True)
+
+    st.subheader("数字孪生对比")
+    test_frame = X_test.copy()
+    test_frame["heat_load"] = y_test
+    test_frame["flow_rate"] = np.nan
+    st.plotly_chart(build_digital_twin_figure(test_frame, y_test), use_container_width=True)
+    st.info("当前 flow_rate 全为空，理论值和残差暂不可用；接入真实流量数据后将自动计算。")
+
+    st.subheader("SHAP 特征贡献图")
+    try:
+        explainer, X_sample, shap_values = make_shap_explanation(model, X_test)
+        matplotlib.rcParams["font.family"] = "DejaVu Sans"
+        display_names = {
+            "hour": "hour",
+            "day_of_week": "day_of_week",
+            "month": "month",
+            "is_weekend": "is_weekend",
+            "heat_load_lag1": "heat_load_lag1",
+            "heat_load_lag24": "heat_load_lag24",
+            "heat_load_rolling_mean_24h": "heat_load_rolling_24h",
+            "supply_temp_rolling_mean_24h": "supply_temp_rolling_24h",
+            "delta_T": "delta_T",
+            "outdoor_temp": "outdoor_temp",
+            "supply_temp": "supply_temp",
+            "return_temp": "return_temp",
+        }
+        values = np.asarray(shap_values)[0]
+        feature_values = X_sample.iloc[0].to_numpy()
+        feature_names = list(X_sample.columns)
+        top_indices = np.argsort(np.abs(values))[::-1][:8]
+        base_value = explainer.expected_value
+        if isinstance(base_value, (list, np.ndarray)):
+            base_value = np.asarray(base_value).reshape(-1)[0]
+        explanation = shap.Explanation(
+            values=values[top_indices],
+            base_values=base_value,
+            data=feature_values[top_indices],
+            feature_names=[display_names.get(feature_names[i], feature_names[i]) for i in top_indices],
+        )
+        fig, ax = plt.subplots(figsize=(16, 9))
+        shap.plots.waterfall(explanation, max_display=8, show=False)
+        ax.set_title("SHAP Feature Contributions")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+    except Exception as exc:
+        st.warning(f"SHAP 特征贡献图暂时无法生成：{exc}")
+
+    st.subheader("按真实热负荷阈值分层评估")
+    threshold_table = pd.DataFrame([
+        {"阈值": "≥10", "样本数": 2178, "MAE": 23.942982, "RMSE": 39.590034, "R²": 0.633357, "MAPE": "32.907530%"},
+        {"阈值": "≥20", "样本数": 2054, "MAE": 24.560956, "RMSE": 40.006190, "R²": 0.590393, "MAPE": "28.908335%"},
+        {"阈值": "≥30", "样本数": 1938, "MAE": 25.334219, "RMSE": 40.775659, "R²": 0.534735, "MAPE": "27.875403%"},
+    ])
+    st.dataframe(threshold_table.style.format({"MAE": "{:.4f}", "RMSE": "{:.4f}", "R²": "{:.4f}"}), use_container_width=True, hide_index=True)
+    st.caption("本页面为回测模式，使用历史数据验证模型精度，不进行真实未来预测。")
+
+
+def render_comfort_page() -> None:
+    """Render the manual-input PMV/PPD thermal comfort page."""
+    render_page_header("热舒适度", "基于 PMV / PPD 模型评估典型工况下的环境舒适性", "INTELLIGENCE / COMFORT")
+    st.info(
+        "当前页面使用手动输入参数进行热舒适度计算。当前统一数据中的 "
+        "indoor_temp 和 humidity 暂为空，因此暂不进行自动数据联动。"
+    )
+
+    input_columns = st.columns(4)
+    indoor_temp = input_columns[0].number_input(
+        "室内温度 (°C)", min_value=10.0, max_value=35.0, value=24.0, step=0.5
+    )
+    indoor_humidity = input_columns[1].number_input(
+        "室内湿度 (%)", min_value=20.0, max_value=90.0, value=50.0, step=1.0
+    )
+    outdoor_temp = input_columns[2].number_input(
+        "室外温度 (°C)", min_value=-20.0, max_value=40.0, value=10.0, step=0.5
+    )
+    air_speed = input_columns[3].number_input(
+        "风速 (m/s)", min_value=0.0, max_value=2.0, value=0.1, step=0.05
+    )
+
+    try:
+        result = calculate_pmv(
+            indoor_temp=indoor_temp,
+            indoor_humidity=indoor_humidity,
+            outdoor_temp=outdoor_temp,
+            air_speed=air_speed,
+        )
+    except Exception as exc:
+        st.error(f"PMV 热舒适度计算失败：{exc}")
+        return
+
+    display_comfort_level = re.sub(r"^[+-]?\d+\s*", "", result["舒适度等级"])
+    st.subheader("计算结果")
+    result_columns = st.columns(3)
+    result_columns[0].metric("PMV", f"{result['PMV']:.3f}")
+    result_columns[1].metric("PPD", f"{result['PPD']:.2f}%")
+    result_columns[2].metric("舒适度等级", display_comfort_level)
+
+    st.subheader("当前输入参数")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "室内温度 (°C)": indoor_temp,
+                    "室内湿度 (%)": indoor_humidity,
+                    "室外温度 (°C)": outdoor_temp,
+                    "风速 (m/s)": air_speed,
+                }
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("PMV/PPD 结果用于环境舒适度分析，不代表设备故障或安全判断。")
+
+
+def render_report_page() -> None:
+    """Render the manually triggered DeepSeek intelligent report page."""
+    render_page_header("AI 智能报告", "将异常事件、舒适度评估和运行建议整理为可审阅报告", "AI ASSISTANT / REPORT")
+    st.info(
+        "当前统一数据中的 indoor_temp 和 humidity 为空，因此舒适度数据使用手动输入，仅用于演示。"
+    )
+    st.warning(
+        "生成报告会调用 DeepSeek API。诊断结果和运行建议仅供人工参考，不代表已确认设备故障，"
+        "也不会自动执行控制指令。"
+    )
+
+    api_key = st.text_input("DeepSeek API Key", type="password")
+    try:
+        current_data, data_signature = get_current_data()
+        data, event_table = load_anomaly_data(data_signature, current_data)
+    except Exception as exc:
+        st.error(f"异常检测结果加载失败：{exc}")
+        return
+
+    if event_table.empty:
+        st.info("当前没有可用于生成报告的异常事件。")
+        if st.session_state.get("authenticated"):
+            render_report_history(st.session_state["user_id"], data_signature)
+        else:
+            st.info("未登录状态不会保存历史报告；如需查看历史报告，请从左侧登录。")
+        return
+
+    event_options = [
+        format_event_option(index, event)
+        for index, (_, event) in enumerate(event_table.iterrows())
+    ]
+    selected_option = st.selectbox(
+        "选择异常事件",
+        event_options,
+        key=f"report_event_selection_{data_signature}",
+    )
+    selected_index = event_options.index(selected_option)
+    selected_event = event_table.iloc[selected_index]
+    st.dataframe(
+        pd.DataFrame([selected_event.to_dict()]),
+        use_container_width=True,
+        hide_index=True,
+    )
+    selected_event_start = pd.to_datetime(selected_event["起始时间"])
+    selected_event_end = pd.to_datetime(selected_event["结束时间"])
+    historical_outdoor_temp = get_event_outdoor_temp(
+        data, selected_event_start, selected_event_end
+    )
+    st.caption(
+        f"异常事件室外温度（历史设备测量均值）：{historical_outdoor_temp:.1f}°C；"
+        "PMV 演示室外温度为下方手动输入值，两者不直接比较。"
+    )
+
+    st.subheader("手动舒适度参数")
+    comfort_inputs = st.columns(4)
+    report_indoor_temp = comfort_inputs[0].number_input(
+        "室内温度 (°C)", min_value=10.0, max_value=35.0, value=24.0, step=0.5, key="report_indoor_temp"
+    )
+    report_indoor_humidity = comfort_inputs[1].number_input(
+        "室内湿度 (%)", min_value=20.0, max_value=90.0, value=50.0, step=1.0, key="report_indoor_humidity"
+    )
+    report_outdoor_temp = comfort_inputs[2].number_input(
+        "室外温度 (°C)", min_value=-20.0, max_value=40.0, value=10.0, step=0.5, key="report_outdoor_temp"
+    )
+    report_air_speed = comfort_inputs[3].number_input(
+        "风速 (m/s)", min_value=0.0, max_value=2.0, value=0.1, step=0.05, key="report_air_speed"
+    )
+
+    if st.button("生成报告", type="primary", key="generate_report_button"):
+        if not api_key.strip():
+            st.warning("请输入 DeepSeek API Key 后再生成报告。")
+        else:
+            try:
+                comfort_result = calculate_pmv(
+                    indoor_temp=report_indoor_temp,
+                    indoor_humidity=report_indoor_humidity,
+                    outdoor_temp=report_outdoor_temp,
+                    air_speed=report_air_speed,
+                )
+                display_comfort_level = re.sub(
+                    r"^[+-]?\d+\s*", "", comfort_result["舒适度等级"]
+                )
+                comfort_data = {
+                    "pmv": comfort_result["PMV"],
+                    "ppd": comfort_result["PPD"],
+                    "comfort_level": display_comfort_level,
+                    "indoor_temp": report_indoor_temp,
+                    "indoor_humidity": report_indoor_humidity,
+                    "outdoor_temp": report_outdoor_temp,
+                    "air_speed": report_air_speed,
+                }
+                anomaly_data = build_report_event_data(data, selected_event)
+                os.environ["DEEPSEEK_API_KEY"] = api_key
+                try:
+                    with st.spinner("正在生成报告..."):
+                        result = generate_full_report(anomaly_data, comfort_data)
+                finally:
+                    os.environ.pop("DEEPSEEK_API_KEY", None)
+                st.session_state["full_report_result"] = result
+                st.session_state["full_report_event"] = selected_option
+                if st.session_state.get("authenticated"):
+                    try:
+                        save_report(
+                            {
+                                "user_id": st.session_state["user_id"],
+                                "dataset_signature": data_signature,
+                                "dataset_name": st.session_state.get(
+                                    "current_data_name",
+                                    st.session_state.get("current_data_source", "未命名数据集"),
+                                ),
+                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "event_start_time": anomaly_data["start_time"],
+                                "event_end_time": anomaly_data["end_time"],
+                                "duration_hours": anomaly_data["duration_hours"],
+                                "anomaly_count": anomaly_data["anomaly_count"],
+                                "suspected_cause": anomaly_data["suspected_cause"],
+                                "diagnosis": result["diagnosis"],
+                                "suggestion": result["suggestion"],
+                                "report": result["report"],
+                            }
+                        )
+                    except Exception as exc:
+                        st.warning(f"报告已生成，但历史报告保存失败：{exc}")
+            except Exception as exc:
+                st.error(friendly_report_error(exc))
+
+    stored_result = st.session_state.get("full_report_result")
+    stored_event = st.session_state.get("full_report_event")
+    if isinstance(stored_result, dict) and stored_event == selected_option:
+        st.caption("以下内容仅供人工参考，不代表已确认设备故障或自动控制指令。")
+        with st.expander("查看诊断摘要"):
+            st.write(stored_result.get("diagnosis", "未提供"))
+        with st.expander("查看运行建议"):
+            st.write(stored_result.get("suggestion", "未提供"))
+        st.subheader("完整运维报告")
+        report_text = stored_result.get("report", "未提供")
+        st.write(report_text)
+        st.download_button(
+            "下载 Markdown 报告",
+            data=report_markdown(
+                stored_result,
+                st.session_state.get("current_data_name", "未命名数据集"),
+                selected_option,
+            ),
+            file_name=f"industrial_ops_report_{datetime.now().strftime('%Y-%m-%d')}.md",
+            mime="text/markdown",
+            key=f"download_current_report_{data_signature}",
+        )
+    elif isinstance(stored_result, dict):
+        st.info("当前选择的异常事件尚未生成报告，请点击“生成报告”。")
+
+    if st.session_state.get("authenticated"):
+        render_report_history(st.session_state["user_id"], data_signature)
+    else:
+        st.info("未登录状态不会保存历史报告；当前报告仍可查看和下载。需要历史报告时，请从左侧登录。")
+
+
+st.set_page_config(page_title="工业 AI 运维平台", layout="wide")
+
+
+def inject_app_styles() -> None:
+    """Apply the shared industrial operations console visual system."""
+    st.markdown(
+        '''
+        <style>
+        :root {
+            --ops-ink: #0f172a;
+            --ops-muted: #64748b;
+            --ops-border: #dbe3ed;
+            --ops-surface: #ffffff;
+            --ops-canvas: #f4f7fb;
+            --ops-blue: #1d4ed8;
+            --ops-blue-dark: #163b7a;
+            --ops-amber: #b45309;
+            --ops-red: #b91c1c;
+            --ops-green: #047857;
+        }
+
+        html, body, [class*="css"] {
+            font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+            color: var(--ops-ink);
+        }
+
+        .stApp {
+            background: var(--ops-canvas);
+        }
+
+        [data-testid="stAppViewContainer"] {
+            background: var(--ops-canvas);
+        }
+
+        [data-testid="stHeader"] {
+            background: transparent;
+        }
+
+        [data-testid="stSidebar"] {
+            background: var(--ops-ink);
+            border-right: 1px solid #1e293b;
+        }
+
+        [data-testid="stSidebar"] > div:first-child {
+            padding: 1.5rem 1rem;
+        }
+
+        [data-testid="stSidebar"] * {
+            color: #e2e8f0;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stRadio"] label {
+            border-radius: 6px;
+            padding: 0.58rem 0.7rem;
+            margin: 0.18rem 0;
+            transition: background 180ms ease, color 180ms ease;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+            background: #1e293b;
+            color: #ffffff;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+            background: #1e40af;
+            color: #ffffff;
+            box-shadow: inset 3px 0 0 #60a5fa;
+        }
+
+        [data-testid="stSidebar"] .stButton > button {
+            width: 100%;
+            min-height: 2.6rem;
+            border: 1px solid #475569;
+            background: #1e293b;
+            color: #f8fafc;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:hover {
+            border-color: #93c5fd;
+            background: #263852;
+            color: #ffffff;
+        }
+
+        .ops-brand {
+            padding: 0.2rem 0 1.5rem;
+            border-bottom: 1px solid #334155;
+            margin-bottom: 1.25rem;
+        }
+
+        .ops-brand-mark {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            margin-bottom: 0.7rem;
+            border: 1px solid #60a5fa;
+            border-radius: 5px;
+            color: #bfdbfe;
+            font: 700 0.78rem/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+            letter-spacing: 0;
+        }
+
+        .ops-brand-title {
+            margin: 0;
+            color: #f8fafc;
+            font-size: 1.02rem;
+            font-weight: 700;
+            letter-spacing: 0;
+        }
+
+        .ops-brand-subtitle {
+            margin: 0.35rem 0 0;
+            color: #94a3b8;
+            font-size: 0.78rem;
+        }
+
+        .ops-page-header {
+            padding: 0.2rem 0 1.35rem;
+            border-bottom: 1px solid var(--ops-border);
+            margin-bottom: 1.35rem;
+        }
+
+        .ops-eyebrow {
+            color: #0284c7;
+            font: 700 0.68rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.55rem;
+        }
+
+        .ops-page-header h1 { margin: 0; }
+        .ops-page-header p { color: var(--ops-muted); margin: 0.45rem 0 0; font-size: 0.95rem; }
+
+        .ops-ai-summary {
+            display: flex;
+            gap: 0.85rem;
+            align-items: flex-start;
+            padding: 1.05rem 1.15rem;
+            border: 1px solid #bae6fd;
+            border-left: 4px solid #0ea5e9;
+            border-radius: 8px;
+            background: #f0f9ff;
+        }
+
+        .ops-ai-dot {
+            flex: 0 0 auto;
+            width: 0.65rem;
+            height: 0.65rem;
+            margin-top: 0.3rem;
+            border-radius: 50%;
+            background: #06b6d4;
+            box-shadow: 0 0 0 4px #cffafe;
+        }
+
+        .ops-ai-summary strong { color: #0c4a6e; }
+        .ops-ai-summary p { margin: 0.25rem 0; color: #164e63; }
+        .ops-ai-summary small { color: #64748b; }
+
+        .ops-system-status {
+            display: flex;
+            gap: 0.65rem;
+            align-items: center;
+            margin: 1rem 0;
+            padding: 0.75rem 0.8rem;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            background: #111c2f;
+        }
+
+        .ops-system-status > span { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.15); }
+        .ops-system-status strong, .ops-system-status small { display: block; }
+        .ops-system-status strong { font-size: 0.78rem; color: #f8fafc; }
+        .ops-system-status small { margin-top: 0.2rem; color: #94a3b8; font-size: 0.66rem; }
+        .ops-nav-label { margin: 1.1rem 0 0.3rem; color: #64748b; font: 700 0.66rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: 0.08em; }
+
+        [data-testid="stMainBlockContainer"] {
+            max-width: 1480px;
+            padding-top: 2.2rem;
+            padding-bottom: 3rem;
+        }
+
+        [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {
+            gap: 0.9rem;
+        }
+
+        [data-testid="stMarkdownContainer"] p {
+            line-height: 1.55;
+        }
+
+        [data-testid="stCaptionContainer"] {
+            color: var(--ops-muted);
+        }
+
+        h1 {
+            color: var(--ops-blue-dark);
+            font-size: clamp(1.65rem, 2.3vw, 2.25rem);
+            font-weight: 750;
+            letter-spacing: 0;
+            margin-bottom: 0.35rem;
+        }
+
+        h2, h3 {
+            color: var(--ops-ink);
+            letter-spacing: 0;
+        }
+
+        h3 {
+            margin-top: 1.65rem;
+            font-size: 1.05rem;
+        }
+
+        [data-testid="stMetric"] {
+            min-height: 7rem;
+            padding: 1rem 1.1rem;
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: var(--ops-muted);
+            font-size: 0.82rem;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: var(--ops-blue-dark);
+            font-size: 1.65rem;
+            font-weight: 700;
+        }
+
+        [data-testid="stMetricDelta"] { font-size: 0.72rem; }
+
+        .stButton > button, .stDownloadButton > button,
+        [data-testid="stFormSubmitButton"] > button {
+            min-height: 2.6rem;
+            border-radius: 6px;
+            border: 1px solid #bfdbfe;
+            font-weight: 650;
+            transition: background 180ms ease, border-color 180ms ease, transform 180ms ease;
+        }
+
+        .stButton > button[kind="primary"],
+        [data-testid="stFormSubmitButton"] > button[kind="primary"] {
+            border-color: var(--ops-blue);
+            background: var(--ops-blue);
+            color: #ffffff;
+        }
+
+        .stButton > button[kind="primary"]:hover,
+        [data-testid="stFormSubmitButton"] > button[kind="primary"]:hover {
+            border-color: var(--ops-blue-dark);
+            background: var(--ops-blue-dark);
+        }
+
+        .stButton > button:hover, .stDownloadButton > button:hover,
+        [data-testid="stFormSubmitButton"] > button:hover {
+            border-color: var(--ops-blue);
+            transform: translateY(-1px);
+        }
+
+        [data-testid="stDataFrame"] {
+            overflow: hidden;
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+        }
+
+        [data-testid="stDataFrame"] iframe {
+            border-radius: 7px;
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 7px;
+            border-left-width: 4px;
+        }
+
+        [data-testid="stFileUploader"] {
+            padding: 0.35rem;
+            border: 1px dashed #93c5fd;
+            border-radius: 8px;
+            background: #f8fbff;
+        }
+
+        [data-testid="stPlotlyChart"] {
+            padding: 0.4rem 0.45rem 0.1rem;
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+        }
+
+        input, textarea, [data-baseweb="select"] > div {
+            border-radius: 6px !important;
+        }
+
+        input:focus, textarea:focus,
+        [data-baseweb="select"] > div:focus-within,
+        button:focus-visible {
+            outline: 3px solid rgba(37, 99, 235, 0.28) !important;
+            outline-offset: 2px;
+        }
+
+        [data-testid="stExpander"] {
+            border: 1px solid var(--ops-border);
+            border-radius: 8px;
+            background: var(--ops-surface);
+        }
+
+        [data-testid="stFileUploaderDropzone"] {
+            min-height: 8rem;
+            border-color: #93c5fd;
+            background: #ffffff;
+        }
+
+        [data-testid="stStatusWidget"] {
+            border-radius: 6px;
+        }
+
+        @media (max-width: 768px) {
+            [data-testid="stMainBlockContainer"] {
+                padding: 1.25rem 1rem 2rem;
+            }
+
+            h1 {
+                font-size: 1.55rem;
+            }
+
+            .ops-page-header p { font-size: 0.88rem; }
+
+            [data-testid="stMetric"] {
+                min-height: 6.2rem;
+                padding: 0.8rem;
+            }
+
+            [data-testid="stMetricValue"] {
+                font-size: 1.35rem;
+            }
+
+            [data-testid="stSidebar"] > div:first-child {
+                padding: 1rem 0.8rem;
+            }
+
+            [data-testid="stFileUploaderDropzone"] {
+                min-height: 7rem;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                scroll-behavior: auto !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+        </style>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+
+inject_app_styles()
+
+
+def render_login() -> None:
+    """Render the demo login gate."""
+    st.title("工业 AI 运维平台")
+    st.subheader("登录")
+    st.caption("当前为演示登录系统，账号仅用于区分各自的历史报告。")
+    with st.form("login_form"):
+        username = st.text_input("用户名")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", type="primary")
+    st.info("演示账号：demo / demo123；admin / admin123")
+    if st.button("返回应用", key="back_to_app_button"):
+        st.session_state["show_login"] = False
+        st.rerun()
+    if submitted:
+        user = authenticate_user(username, password)
+        if user is None:
+            st.error("用户名或密码错误。")
+        else:
+            st.session_state["authenticated"] = True
+            st.session_state["user_id"] = user["user_id"]
+            st.session_state["display_name"] = user["display_name"]
+            st.session_state["show_login"] = False
+            st.rerun()
+
+
+if st.session_state.get("show_login"):
+    render_login()
+    st.stop()
+
+with st.sidebar:
+    st.markdown(
+        '''
+        <div class="ops-brand">
+            <div class="ops-brand-mark">AI</div>
+            <p class="ops-brand-title">工业 AI 运维平台</p>
+            <p class="ops-brand-subtitle">Heat Exchange Station Console</p>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("authenticated"):
+        st.caption(f"当前用户：{st.session_state.get('display_name', st.session_state['user_id'])}")
+        if st.button("退出登录", key="logout_button"):
+            st.session_state.pop("authenticated", None)
+            st.session_state.pop("user_id", None)
+            st.session_state.pop("display_name", None)
+            st.session_state.pop("full_report_result", None)
+            st.session_state.pop("full_report_event", None)
+            st.rerun()
+    else:
+        st.caption("当前为访客模式")
+        if st.button("登录", key="login_button"):
+            st.session_state["show_login"] = True
+            st.rerun()
+
+st.sidebar.markdown("<div class='ops-system-status'><span></span><div><strong>系统运行正常</strong><small>数据服务 · 模型服务 · AI 分析</small></div></div>", unsafe_allow_html=True)
+st.sidebar.markdown("<div class='ops-nav-label'>WORKSPACE</div>", unsafe_allow_html=True)
+page = st.sidebar.radio("页面", ["总览", "数据上传", "负荷预测", "异常检测", "热舒适度", "智能报告"], index=0)
+if page == "总览":
+    render_overview_page()
+elif page == "数据上传":
+    try:
+        render_upload_page()
+    except Exception as exc:
+        st.error(f"数据页面加载失败：{exc}")
+elif page == "负荷预测":
+    render_prediction_page()
+elif page == "异常检测":
+    render_anomaly_page()
+elif page == "热舒适度":
+    render_comfort_page()
+else:
+    render_report_page()
